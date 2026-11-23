@@ -1,15 +1,16 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { JobWatch } from './JobWatch';
 import { call, startJob } from '@/lib/client';
 import { bytes } from '@/lib/descriptor';
 import type { Words } from '@/lib/i18n';
-import { CLOUD_IMAGES as IMAGES, NbsVolume as Volume, VOLUME_NAME as VOLUME } from '@/lib/images';
+import { CLOUD_IMAGES as IMAGES, LocalImage, NbsVolume as Volume, VOLUME_NAME as VOLUME } from '@/lib/images';
 
 const GIB = 1024 ** 3;
+type Source = 'url' | 'local' | 'image';
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 /** What `onto` names a volume of NBS's by. */
 const NBS = 'nbs:';
@@ -53,8 +54,11 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
   const [os, setOs] = useState<'linux' | 'windows'>('linux');
   /* An image or a snapshot named in the address -- its row's "Create a VM"
    * -- is the one picked */
-  const [source, setSource] = useState<'url' | 'image'>(given ? 'image' : 'url');
+  const [source, setSource] = useState<Source>(given ? 'image' : 'url');
   const [url, setUrl] = useState(IMAGES[0]!.url);
+  const [localImages, setLocalImages] = useState<LocalImage[] | null>(null);
+  const [localImage, setLocalImage] = useState('');
+  const [localError, setLocalError] = useState('');
   const [image, setImage] = useState(given ?? '');
   const [clone, setClone] = useState('');
   const [disk, setDisk] = useState(given ? '' : '20');
@@ -86,8 +90,22 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
   const [error, setError] = useState('');
   const [job, setJob] = useState<number | null>(null);
 
+  const loadLocalImages = useCallback(async () => {
+    const r = await call(host, 'vm', 'local_images');
+    if (!r.ok) {
+      setLocalImages([]);
+      setLocalError(r.error.message);
+      return;
+    }
+    const listed = (r.data as { images?: LocalImage[] }).images ?? [];
+    setLocalImages(listed);
+    setLocalImage((current) => listed.some((i) => i.path === current) ? current : (listed[0]?.path ?? ''));
+    setLocalError('');
+  }, [host]);
+
   useEffect(() => {
     let live = true;
+    void loadLocalImages();
     call(host, 'vm', 'devices').then((r) => {
       if (live && r.ok) setDevices(((r.data as { devices?: Device[] }).devices ?? []).filter(usable));
     });
@@ -114,22 +132,24 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
       if (live && r.ok) setNodes((r.data as { nodes?: NumaNode[] }).nodes ?? []);
     });
     return () => { live = false; };
-  }, [host]);
+  }, [host, loadLocalImages]);
   const images = (volumes ?? []).filter((v) => v.kind !== 'volume');
   const targets = (volumes ?? []).filter((v) => v.kind === 'volume');
   const device = devices.find((d) => d.id === onto);
   const volume = onto.startsWith(NBS) ? targets.find((v) => NBS + v.name === onto) : undefined;
   const picked = images.find((v) => v.name === image);
+  const pickedLocal = localImages?.find((i) => i.path === localImage);
   /* A file's size is asked; a device's and a volume's disk is theirs; an
    * image's clone is the image's size unless asked bigger. */
   const sized = source === 'image' || onto === '';
 
-  function pickSource(s: 'url' | 'image') {
+  function pickSource(s: Source) {
     setSource(s);
     setOnto('');
     setForce(false);
-    setDisk(s === 'url' ? (os === 'windows' ? '64' : '20') : '');
+    setDisk(s === 'image' ? '' : (os === 'windows' ? '64' : '20'));
     if (s === 'image' && !image && images.length) setImage(images[0]!.name);
+    if (s === 'local' && !localImage && localImages?.length) setLocalImage(localImages[0]!.path);
   }
 
   function pickOs(next: 'linux' | 'windows') {
@@ -164,7 +184,15 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
       if (cloneName !== name) params.onto = NBS + cloneName;
       if (disk) params.size_bytes = Math.round(Number(disk) * GIB);
     } else {
-      params.url = url;
+      if (source === 'local') {
+        if (!pickedLocal) {
+          setError(ru ? 'Выберите образ из /images.' : 'Pick an image from /images.');
+          return;
+        }
+        params.file = pickedLocal.path;
+      } else {
+        params.url = url;
+      }
       if (onto) {
         params.onto = onto;
         if (force) params.force = true;
@@ -211,32 +239,63 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
                 : 'A prepared UEFI raw/qcow2 image with virtio-blk/net, its user and RDP. CloudHv and Hyper-V are selected; no cloud-init seed is added.')}
           </span>
         </label>
-        {volumes !== null && (
-          <fieldset className="flex gap-4 text-sm text-fg-soft" data-testid="source">
-            <legend className="sr-only">{ru ? 'Из чего диск' : 'Its disk made of'}</legend>
-            <label className="flex items-center gap-2">
-              <input type="radio" name="source" value="url" checked={source === 'url'} onChange={() => pickSource('url')} />
-              {ru ? 'Образ по URL' : 'An image by its URL'}
-            </label>
+        <fieldset className="flex flex-wrap gap-4 text-sm text-fg-soft" data-testid="source">
+          <legend className="sr-only">{ru ? 'Из чего диск' : 'Its disk made of'}</legend>
+          <label className="flex items-center gap-2">
+            <input type="radio" name="source" value="url" checked={source === 'url'} onChange={() => pickSource('url')} />
+            {ru ? 'Образ по URL' : 'An image by its URL'}
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="radio" name="source" value="local" checked={source === 'local'} onChange={() => pickSource('local')} />
+            {ru ? 'Образ из /images' : 'An image from /images'}
+          </label>
+          {volumes !== null && (
             <label className="flex items-center gap-2">
               <input type="radio" name="source" value="image" checked={source === 'image'} onChange={() => pickSource('image')} />
               {ru ? 'Образ NBS' : 'An image of NBS\'s'}
             </label>
-          </fieldset>
-        )}
-        {source === 'url' ? (
+          )}
+        </fieldset>
+        {source !== 'image' ? (
           <>
-            <label className="block text-sm text-fg-soft">{w.imageUrl}
-              {os === 'linux' && (
-                <select value={IMAGES.some((i) => i.url === url) ? url : ''} onChange={(e) => e.target.value && setUrl(e.target.value)}
-                  className={input}>
-                  {IMAGES.map((i) => <option key={i.url} value={i.url}>{i.label}</option>)}
-                  <option value="">…</option>
-                </select>
-              )}
-              <input value={url} onChange={(e) => setUrl(e.target.value)} name="url"
-                placeholder={os === 'windows' ? 'https://example/windows-server.raw' : ''} className={input + ' font-mono text-xs'} />
-            </label>
+            {source === 'url' ? (
+              <label className="block text-sm text-fg-soft">{w.imageUrl}
+                {os === 'linux' && (
+                  <select value={IMAGES.some((i) => i.url === url) ? url : ''} onChange={(e) => e.target.value && setUrl(e.target.value)}
+                    className={input}>
+                    {IMAGES.map((i) => <option key={i.url} value={i.url}>{i.label}</option>)}
+                    <option value="">…</option>
+                  </select>
+                )}
+                <input value={url} onChange={(e) => setUrl(e.target.value)} name="url"
+                  placeholder={os === 'windows' ? 'https://example/windows-server.raw' : ''} className={input + ' font-mono text-xs'} />
+              </label>
+            ) : (
+              <div>
+                <label className="block text-sm text-fg-soft">{ru ? 'Локальный образ' : 'Local image'}
+                  <select value={localImage} onChange={(e) => setLocalImage(e.target.value)} name="file"
+                    disabled={!localImages?.length} className={input + ' font-mono text-xs'}>
+                    {localImages === null ? (
+                      <option value="">{ru ? 'Загрузка…' : 'Loading…'}</option>
+                    ) : localImages.length === 0 ? (
+                      <option value="">{ru ? 'В /images нет файлов' : 'No files in /images'}</option>
+                    ) : localImages.map((i) => (
+                      <option key={i.path} value={i.path}>{i.name} · {bytes(i.size_bytes)}</option>
+                    ))}
+                  </select>
+                </label>
+                <div className="mt-1 flex items-center justify-between gap-3 text-xs">
+                  <span className="text-muted">
+                    {ru ? 'Скопируйте образ qcow2 или raw в /images на хосте. Исходный файл останется на месте.'
+                      : 'Copy a qcow2 or raw image into /images on the host. The source file stays in place.'}
+                  </span>
+                  <button type="button" onClick={() => void loadLocalImages()} className="shrink-0 text-accent hover:underline">
+                    {w.refresh}
+                  </button>
+                </div>
+                {localError && <p role="alert" className="mt-1 text-xs text-bad">{localError}</p>}
+              </div>
+            )}
             <label className="block text-sm text-fg-soft">{ru ? 'Где диск' : 'Its disk'}
               <select value={onto} onChange={(e) => { setOnto(e.target.value); setForce(false); }} name="onto" className={input}>
                 <option value="">{ru ? 'Файл в папке машины' : 'A file in its folder'}</option>
@@ -385,7 +444,7 @@ export function CreateVm({ host, locale, w, image: given }: { host: string; loca
             placeholder="203.0.113.9" className={input + ' font-mono text-xs'} />
         </label>}
         {error && <p role="alert" className="text-sm text-bad">{error}</p>}
-        <button type="submit" disabled={job !== null || (source === 'image' && !picked)}
+        <button type="submit" disabled={job !== null || (source === 'image' && !picked) || (source === 'local' && !pickedLocal)}
           className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg hover:bg-accent-strong disabled:opacity-60">
           {w.create}
         </button>

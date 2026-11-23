@@ -3742,6 +3742,16 @@ hv: /vms/noble/vm.toml written -- hv start noble boots it: hvboot, a 20480 MiB d
 $ hv start noble
 ```
 
+A file copied into `/images` on the host is the same create without a
+download: `hv create <name> /images/<file> [words]`, or the host API's
+`file` in place of `url`. The panel's **An image from /images** choice lists
+these files (the `local_images` read), with a refresh for one copied while
+the form is open. Only a regular file directly in that folder is named; a
+path elsewhere, including one with `..`, is refused. The source is never
+renamed, removed or written: qcow2 is converted into the VM's folder and a
+raw image is copied there with its holes left out. `size=`, `onto=` and the
+rest of the create are the URL form's.
+
 For a prepared Windows disk, `hv create <name> <url> windows` takes the same
 qcow2 or raw image by its URL but boots it by CloudHv with Hyper-V. The image
 must already contain a UEFI installation, virtio-blk and virtio-net drivers,
@@ -3766,11 +3776,12 @@ URL. `start` starts either kind by the same API job once made.
   module going -- ends the download as the next of the body arrives, the
   file removed.
 - **The disk**: a qcow2 image is converted ([A disk from a cloud's
-  image](#a-disk-from-a-clouds-image)) and the download removed; a raw one
-  is taken as it is; anything else is refused by what it is. `size=` (K,
-  M, G, T) grows it with a hole -- never under what the image holds -- for
-  the guest to grow its root into: cloud-init's growpart does, on its first
-  boot.
+  image](#a-disk-from-a-clouds-image)); a raw download is taken as it is, and
+  a local raw image copied with its holes left out. A download is removed
+  once made into the disk; a local source stays untouched. Anything else is
+  refused by what it is. `size=` (K, M, G, T) grows the VM's disk with a hole
+  -- never under what the image holds -- for the guest to grow its root into:
+  cloud-init's growpart does, on its first boot.
 - **Linux's seed**: `seed.iso`, the VM's second disk, read-only -- an ISO 9660
   labelled `cidata` with Rock Ridge's names (`diskimage::iso`), which
   cloud-init's NoCloud finds by its label. Its meta-data names the machine
@@ -3876,9 +3887,11 @@ $ hv start v1
   in sectors, a part of a block served by the device in whole ones.
 
 The host API's `create` takes an image of NBS's as `image`, in place of
-`url` -- one of the two -- its clone named by `onto` (`nbs:<volume>`) where
-not the VM's, and grown to `size_bytes`; and a URL's image poured onto a
-volume with `onto=nbs:<volume>`. Its `image` makes an image as `hv image`
+`url` or the local library's `file` -- one of the three -- its clone named by
+`onto` (`nbs:<volume>`) where not the VM's, and grown to `size_bytes`; and a
+URL's or local file's image poured onto a volume with `onto=nbs:<volume>`.
+Its `local_images` lists the regular files directly under `/images`; its
+`image` makes an image as `hv image`
 does, and `snapshot` takes a snapshot of a VM's volume -- a running one's
 too, its session paused for it -- of which VMs are made as of an image. The
 panel has them all: an Images page (NBS's images and snapshots, a new image
@@ -3982,9 +3995,9 @@ commands are:
 
 | | |
 |---|---|
-| reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `disk_io` (what each disk of a running VM has done since its guest's boot -- reads, writes and their bytes, flushes, errors, discards, writes of zeros, and `wait_ns`, the time its backend took over the requests it answered, from the hand-off to the answer, a flush behind a write counted with the write: the virtio disk's own counters -- by the word the VM was started with, and when they were read, the host's boot time; a client makes its IOPS and bandwidth of two, and the guest's restarts say where the counters began anew), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
+| reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `local_images` (the regular files directly under `/images`, each with its name, path and size), `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `disk_io` (what each disk of a running VM has done since its guest's boot -- reads, writes and their bytes, flushes, errors, discards, writes of zeros, and `wait_ns`, the time its backend took over the requests it answered, from the hand-off to the answer, a flush behind a write counted with the write: the virtio disk's own counters -- by the word the VM was started with, and when they were read, the host's boot time; a client makes its IOPS and bandwidth of two, and the guest's restarts say where the counters began anew), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
 | actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev` as its bytes -- so one that no longer parses, a key misspelt by hand, can be mended), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again), `snapshot` (a snapshot of a disk of the VM's that is a volume of NBS's -- its first, or `disk` -- as `nbs volume snapshot` takes one: of a VM running here, its guest's session paused for it, the disk as a power cut would leave it; of one running on another host, refused, naming the host; of a VM of a file or a device, refused: a clone copies it whole) |
-| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`, or an image of NBS's by its name, `image`, as `hv create <name> image=nbs:<image>`: `os` is `linux` by default or `windows`, which selects CloudHv with Hyper-V and no seed; with `onto` and `force`, a URL's poured onto a device of nos's or a volume of NBS's, and an image's clone named; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete`, `image` (an image of NBS's made of a cloud's image by its URL, or of a file of nos's, as `hv image` makes one; a name NBS would refuse refused before anything is fetched) |
+| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL or a file directly under `/images`, as `hv create <name> <url|/images/file>`; the local source left untouched, or an image of NBS's by its name, `image`, as `hv create <name> image=nbs:<image>`: `os` is `linux` by default or `windows`, which selects CloudHv with Hyper-V and no seed; with `onto` and `force`, a URL's or local file's image poured onto a device of nos's or a volume of NBS's, and an image's clone named; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete`, `image` (an image of NBS's made of a cloud's image by its URL, or of a file of nos's, as `hv image` makes one; a name NBS would refuse refused before anything is fetched) |
 
 A job says as it goes what the command would, as its log, and how far it
 has got; its cancel -- or the module's going -- stops a download, a

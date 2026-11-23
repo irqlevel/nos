@@ -616,6 +616,7 @@ const reads = {
                vms: on.filter((v) => v.network === n).map((v) => v.name) };
     }), alone: on.filter((v) => !v.network).map((v) => v.name) };
   },
+  'vm.local_images': () => ({ images: LOCAL_IMAGES }),
   'vm.config_get': (p) => {
     const v = vmNamed(p);
     const disks = v.disks.map((d) => `"${d.file}${d.read_only ? ':ro' : ''}"`).join(', ');
@@ -1286,6 +1287,10 @@ const actions = {
 };
 
 const SEED_DISK = { file: 'seed.iso', size_bytes: 65536, read_only: true };
+const LOCAL_IMAGES = [
+  { name: 'debian-local.qcow2', path: '/images/debian-local.qcow2', size_bytes: 620 * MIB },
+  { name: 'alpine-local.raw', path: '/images/alpine-local.raw', size_bytes: 512 * MIB },
+];
 const createKernel = (p) => p.os === 'windows' ? '/lib/CLOUDHV.fd' : '/lib/hvboot';
 const createDisks = (p, first) => p.os === 'windows' ? [first] : [first, SEED_DISK];
 
@@ -1329,8 +1334,9 @@ function createOfImage(name, p) {
   });
 }
 
-/** A URL's image poured onto a volume of NBS's (onto=nbs:<volume>): over
- * what is on it, taken from a writer elsewhere with force. */
+/** A URL's or local file's image poured onto a volume of NBS's
+ * (onto=nbs:<volume>): over what is on it, taken from a writer elsewhere with
+ * force. */
 function createOntoVolume(name, p) {
   nbsMember();
   const word = p.onto.slice(4);
@@ -1348,8 +1354,10 @@ function createOntoVolume(name, p) {
   if (v.writer && v.writer !== me.name && p.force !== true) {
     throw new Refused('conflict', 'nbs:' + word + ' is attached on host ' + v.writer + ' -- force takes it', 'onto');
   }
-  return job('vm', 'create', 4, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
-    'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'][i], () => {
+  const lines = [
+    ...(p.file === undefined ? ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%'] : []),
+    'nbs:' + word + ': 3584 MiB poured, the rest of the volume zeroes', '/vms/' + name + '/vm.toml written'];
+  return job('vm', 'create', lines.length, (i) => lines[i], () => {
     vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
                firewall: p.firewall ?? 'default', public: p.public ?? null, kernel: createKernel(p),
       disks: createDisks(p, { file: 'nbs:' + word, size_bytes: null, read_only: false }) });
@@ -1512,11 +1520,18 @@ const jobMethods = {
   },
   'vm.create': (p) => {
     const name = need(p, 'name');
-    if (p.url !== undefined && p.image !== undefined) {
-      throw new Refused('invalid', "is given with a URL: a VM is made of one image, a URL's or NBS's", 'image');
+    const sources = ['url', 'file', 'image'].filter((key) => p[key] !== undefined);
+    if (sources.length > 1) {
+      throw new Refused('invalid', 'a VM is made of one URL, local file or NBS image', sources[1]);
     }
-    if (p.url === undefined && p.image === undefined) {
-      throw new Refused('invalid', "is wanted -- or an image of NBS's, `image`", 'url');
+    if (sources.length === 0) {
+      throw new Refused('invalid', "is wanted -- or a local image, `file`, or an image of NBS's, `image`", 'url');
+    }
+    if (p.file !== undefined && !LOCAL_IMAGES.some((image) => image.path === p.file)) {
+      if (typeof p.file !== 'string' || !/^\/images\/[^/]+$/.test(p.file)) {
+        throw new Refused('invalid', "is a file's path directly under /images", 'file');
+      }
+      throw new Refused('failed', p.file + ': no such file', 'file');
     }
     if (vms.has(name)) {
       throw new Refused('conflict', name + ' is there already', 'name');
@@ -1559,12 +1574,16 @@ const jobMethods = {
     if (onto && p.size_bytes !== undefined) {
       throw new Refused('invalid', "size= is a file's: a device's disk is the device's size", 'size_bytes');
     }
-    return job('vm', 'create', 5, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
-      onto ? '/vms/' + name + '/image: qcow2, a disk of 3584 MiB -- onto ' + onto.name
-        : 'qcow2 version 3 -- into /vms/' + name + '/disk.raw',
+    const lines = [
+      ...(p.file === undefined ? ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%'] : []),
+      p.file ? p.file + (onto ? ': qcow2, a disk of 3584 MiB -- onto ' + onto.name
+        : ': qcow2 version 3 -- into /vms/' + name + '/disk.raw')
+        : onto ? '/vms/' + name + '/image: qcow2, a disk of 3584 MiB -- onto ' + onto.name
+          : 'qcow2 version 3 -- into /vms/' + name + '/disk.raw',
       onto ? onto.name + ': 3584 MiB written in 4.2 s, the rest of the device given back to it'
         : 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
-      '/vms/' + name + '/vm.toml written'][i], () => {
+      '/vms/' + name + '/vm.toml written'];
+    return job('vm', 'create', lines.length, (i) => lines[i], () => {
       vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, node: p.node ?? null, network: p.network ?? null,
                  firewall: p.firewall ?? 'default', public: p.public ?? null, kernel: createKernel(p),
                  disks: createDisks(p, onto ? deviceDisk(onto, false)

@@ -151,8 +151,10 @@ def create_script(port):
     again refused; a raw image taken as it is; a URL with nothing at it, a
     file that is no image and a size= under the image's refused, each
     leaving nothing; and an image of NBS's made, and a VM of one, on a host
-    with no NBS: refused, leaving nothing (N10d3). Last, a small raw image
-    made a Windows VM: CloudHv with Hyper-V, Windows' defaults and no seed."""
+    with no NBS: refused, leaving nothing (N10d3). A small raw image made a
+    Windows VM gets CloudHv with Hyper-V, Windows' defaults and no seed.
+    Finally local qcow2 and raw images in /images make disks held by SHA-256,
+    without a download and with both sources left byte for byte."""
     url = "http://10.0.2.2:%d/" % port
     return [
         "hv create c1 %simg.qcow2 size=16M mem=512 password=nos port=3" % url,
@@ -175,6 +177,14 @@ def create_script(port):
         "cat /vms/fwcloud/vm.toml",
         "ls /vms/fwcloud",
         "hv delete fwcloud",
+        "hv create localq /images/local.qcow2 size=16M",
+        "sha256 /vms/localq/disk.raw",
+        "sha256 /images/local.qcow2",
+        "hv create localr /images/raw.img",
+        "sha256 /vms/localr/disk.raw",
+        "sha256 /images/raw.img",
+        "hv delete localq",
+        "hv delete localr",
     ]
 
 
@@ -552,9 +562,10 @@ def convert_images(tmp, rootdir):
 def create_images(tmp, rootdir):
     """What the web server serves `hv create`: the compressed image the
     convert checks have, a raw disk -- a partition table's signature, and
-    random bytes -- and a file that is no image. The SHA-256 the two disks
-    must have once made: the first's grown to CREATE_SIZE, the second's as
-    it is."""
+    random bytes -- and a file that is no image. The two images are also put
+    in a local /images library. The SHA-256 the two disks must have once made:
+    the first's grown to CREATE_SIZE, the second's as it is; and the local
+    qcow2 source's unchanged SHA-256."""
     www = os.path.join(tmp, "www")
     os.makedirs(www)
     shutil.copy(os.path.join(rootdir, "img.qcow2"), www)
@@ -565,10 +576,16 @@ def create_images(tmp, rootdir):
         f.write(raw)
     with open(os.path.join(www, "notes.txt"), "w") as f:
         f.write("no disk here\n" * 100)
+    library = os.path.join(rootdir, "images")
+    os.makedirs(library)
+    shutil.copy(os.path.join(rootdir, "img.qcow2"), os.path.join(library, "local.qcow2"))
+    shutil.copy(os.path.join(www, "raw.img"), os.path.join(library, "raw.img"))
+    with open(os.path.join(library, "local.qcow2"), "rb") as f:
+        local = hashlib.sha256(f.read()).hexdigest()
     with open(os.path.join(tmp, "convert.raw"), "rb") as f:
         disk = f.read()
     grown = hashlib.sha256(disk + bytes(CREATE_SIZE - len(disk))).hexdigest()
-    return www, grown, hashlib.sha256(raw).hexdigest()
+    return www, grown, hashlib.sha256(raw).hexdigest(), local
 
 
 def web_server(root):
@@ -587,8 +604,9 @@ def web_server(root):
     return server, server.server_address[1]
 
 
-def create_checks(out, grown, raw):
-    """What `hv create <name> <url>` answered to create_script, in order."""
+def create_checks(out, grown, raw, local):
+    """What `hv create <name> <url>` and its local-file form answered to
+    create_script, in order."""
     pt.check("hv create from a URL: a qcow2 image downloaded, made a 16 MiB disk, its seed given the key and a "
              "password, and a vm.toml written",
              "/vms/c1/vm.toml written -- hv start c1 boots it: hvboot, a 16 MiB disk, cloud-init given 1 key and a "
@@ -619,8 +637,9 @@ def create_checks(out, grown, raw):
              "insmod /nbs-mds.ko" in out[13], out[13])
     pt.check("and neither left anything behind: no folder, no download",
              "c7" not in out[14] and ".image-" not in out[14], out[14])
-    clone_checks(out[15:], grown)
-    fw = out[15 + len(CLONE):]
+    clone_checks(out[15:15 + len(CLONE)], grown)
+    tail = out[15 + len(CLONE):]
+    fw = tail[:4]
     pt.check("a raw image made a Windows VM: CloudHv with Hyper-V, its defaults, one disk and no cloud-init files",
              len(fw) == 4 and "boots it: CloudHv with Hyper-V" in fw[0] and "no cloud-init seed" in fw[0]
              and all(w in fw[1] for w in ('kernel = "/lib/CLOUDHV.fd"', "firmware = true", "hyperv = true",
@@ -629,6 +648,17 @@ def create_checks(out, grown, raw):
              and all(w in fw[2] for w in ("disk.raw", "vm.toml"))
              and all(w not in fw[2] for w in ("seed.iso", "user-data"))
              and "deleted" in fw[3], "\n".join(fw))
+    made = tail[4:]
+    pt.check("a local qcow2 is converted without a download, its disk grown as a URL's would be",
+             len(made) == 8 and "/vms/localq/vm.toml written" in made[0] and "download:" not in made[0]
+             and grown in made[1], "\n".join(made[:2]))
+    pt.check("and the local qcow2 itself is left byte for byte", len(made) == 8 and local in made[2],
+             made[2] if len(made) > 2 else made)
+    pt.check("a local raw is copied, not renamed or removed: the VM's disk and the source both byte for byte",
+             len(made) == 8 and "/vms/localr/vm.toml written" in made[3] and "download:" not in made[3]
+             and raw in made[4] and raw in made[5], "\n".join(made[3:6]))
+    pt.check("and both local VMs deleted", len(made) == 8 and "deleted" in made[6] and "deleted" in made[7],
+             "\n".join(made[6:]))
 
 
 def clone_checks(out, grown):
@@ -733,17 +763,19 @@ def convert_checks(out, digest):
     pt.check("and hv convert alone says how it is used", "hv convert <image> <disk|device|nbs:volume>" in out[8], out[8])
 
 
-def rootfs(tmp, arch, rc=None):
+def rootfs(tmp, arch, rc=None, library=None):
     """A root filesystem carrying hv.ko -- and on x86-64 hvboot and CloudHv,
-    the PVH images the script boots -- the images `hv convert` is given, and an
-    /etc/rc when one is wanted. The image, and the SHA-256 of the disk the
-    images are of."""
+    the PVH images the script boots -- the images `hv convert` is given, an
+    optional local image library copied to /images, and an /etc/rc when one
+    is wanted. The image, and the SHA-256 of the disk the images are of."""
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc", "ssh"), exist_ok=True)
     shutil.copy(module(arch), rootdir)
     with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
         f.write("# the key hv create gives cloud-init\n%s\n" % TEST_KEY)
     digest = convert_images(tmp, rootdir)
+    if library is not None:
+        shutil.copytree(library, os.path.join(rootdir, "images"))
     if arch == "x86_64":
         if not os.path.exists(HVBOOT):
             sys.exit("no %s -- make first" % HVBOOT)
@@ -837,10 +869,10 @@ def x86(args):
     staged = os.path.join(tmp, "staged")
     os.makedirs(staged)
     convert_images(tmp, staged)
-    www, grown, raw = create_images(tmp, staged)
+    www, grown, raw, local = create_images(tmp, staged)
     server, port = web_server(www)
     script = SCRIPT + create_script(port) + ["rmmod hv"] + TRACE + [RC_LAST]
-    image, digest = rootfs(tmp, "x86_64", script)
+    image, digest = rootfs(tmp, "x86_64", script, library=os.path.join(staged, "images"))
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
     print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
@@ -872,7 +904,7 @@ def x86(args):
         # end of the script is waited for by it (`RC_DONE`).
         wait_done(log, 600)
         expect = set(args.expect) | (set() if kvm else TCG_OFFERS)
-        x86_checks(blocks(log), script, digest, grown, raw, expect)
+        x86_checks(blocks(log), script, digest, grown, raw, local, expect)
     finally:
         server.shutdown()
         pt.kill(p)
@@ -1281,7 +1313,7 @@ OFFER_NAMES = {"pku": "PKU", "rdtscp": "RDTSCP", "rdpid": "RDPID", "invpcid": "I
                "ibpb": "IBPB"}
 
 
-def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
+def x86_checks(ran, script, digest, grown, raw, local, expect=frozenset()):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
         return
@@ -1438,7 +1470,7 @@ def x86_checks(ran, script, digest, grown, raw, expect=frozenset()):
     at = after_uefi + 2 + len(CONVERT)
     # Of what is left: the creates, then `rmmod hv`, TRACE and `RC_LAST`.
     created = len(script) - 2 - len(TRACE) - at
-    create_checks(out[at:at + created], grown, raw)
+    create_checks(out[at:at + created], grown, raw, local)
     pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
     at += created + 1
     trace_checks(out[at:at + len(TRACE)])

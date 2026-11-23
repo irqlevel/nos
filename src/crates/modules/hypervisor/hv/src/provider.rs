@@ -7,10 +7,11 @@
 //! reads in its lines, a caller here reads in the answer.
 //!
 //! - reads: `list` (every VM: its folder's, and those on the list without
-//!   one), `get`, `host`, `networks`, `config_get`, `console_read` (a page of
-//!   the console, its control sequences taken out), `disks`, `disk_io` (each
-//!   disk's counters since the guest's boot, and when they were read: a
-//!   client makes its rates of two), `forwards`;
+//!   one), `get`, `host`, `networks`, `local_images` (the files in
+//!   `/images`), `config_get`, `console_read` (a page of the console, its
+//!   control sequences taken out), `disks`, `disk_io` (each disk's counters
+//!   since the guest's boot, and when they were read: a client makes its
+//!   rates of two), `forwards`;
 //! - actions: `config_set` (a vm.toml checked as a start checks it, the old
 //!   one kept as vm.toml.prev), `forward_add` and `forward_del` (kept in its
 //!   vm.toml, and made or taken away now if it runs), `console_write`,
@@ -18,10 +19,11 @@
 //!   volume of NBS's, as `nbs volume snapshot` takes one: a running guest's
 //!   session paused for it);
 //! - jobs: `start`, `stop`, `restart`, `create` (a Linux or prepared Windows
-//!   image by its URL, or an image of NBS's -- an image or a snapshot -- by
-//!   its name: Linux's user-data of the caller's own if given -- a job, which
-//!   only an admin starts -- a port of the switch of its own, nos's ports forwarded,
-//!   `protected`, and started once made, as the call asks), `clone`,
+//!   image by its URL or a file in `/images`, or an image of NBS's -- an
+//!   image or a snapshot -- by its name: Linux's user-data of the caller's
+//!   own if given -- a job, which only an admin starts -- a port of the
+//!   switch of its own, nos's ports forwarded, `protected`, and started once
+//!   made, as the call asks), `clone`,
 //!   `delete`, `image` (an image of NBS's made of a URL's or a file's, as
 //!   `hv image` makes one), `migrate` (a running VM moved to another host of
 //!   the cluster's, as `hv migrate` moves it: its progress the memory sent, a
@@ -59,11 +61,12 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 30] = [
+const METHODS: [Method; 31] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
     Method { name: "networks", kind: Kind::Read },
+    Method { name: "local_images", kind: Kind::Read },
     Method { name: "config_get", kind: Kind::Read },
     Method { name: "console_read", kind: Kind::Read },
     Method { name: "disks", kind: Kind::Read },
@@ -245,6 +248,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "get" => get(state, p, call),
         "host" => host(state, p, call),
         "networks" => networks(state, p, call),
+        "local_images" => local_images(p, call),
         "config_get" => config_get(state, p, call),
         "console_read" => console_read(state, p, call),
         "disks" => disks(state, p, call),
@@ -939,6 +943,49 @@ fn networks(state: &State, p: Params, call: &mut Call) -> Status {
     })
 }
 
+/// The local image library: regular files directly under `/images`, by name.
+/// A missing library is an empty one; a name the API cannot return as text is
+/// left out. The image's format is checked from its bytes when it is used.
+fn local_images(p: Params, call: &mut Call) -> Status {
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let entries = match kcore::fs::list(cloud::LOCAL_DIR) {
+        Ok(entries) => entries,
+        Err(kcore::error::Error::NotFound) => Vec::new(),
+        Err(e) => return refuse(call, Status::Failed, &alloc::format!("{}: {}", cloud::LOCAL_DIR, e), None),
+    };
+    let mut images = Vec::new();
+    for entry in entries.iter().filter(|e| !e.dir) {
+        let Ok(name) = core::str::from_utf8(&entry.name) else { continue };
+        let Some(path) = store::join(cloud::LOCAL_DIR, name) else {
+            return refuse(call, Status::Busy, "out of memory", None);
+        };
+        if !cloud::is_local(&path) {
+            continue;
+        }
+        if images.try_reserve(1).is_err() {
+            return refuse(call, Status::Busy, "out of memory", None);
+        }
+        images.push((String::from(name), path, entry.size));
+    }
+    images.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    answer(call, |w| {
+        w.begin_object();
+        w.key("images");
+        w.begin_list();
+        for (name, path, size) in &images {
+            w.begin_object();
+            w.field_str("name", name);
+            w.field_str("path", path);
+            w.field_uint("size_bytes", *size);
+            w.end_object();
+        }
+        w.end_list();
+        w.end_object();
+    })
+}
+
 fn config_get(state: &State, mut p: Params, call: &mut Call) -> Status {
     let name = match name_param(&mut p, "name", call) {
         Ok(n) => n,
@@ -1494,24 +1541,40 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         Ok(n) => n,
         Err(s) => return s,
     };
-    /* What its disk is made of: a cloud's image by its URL, or an image of
-     * NBS's by its name (`hv create <name> image=nbs:<image>`) -- one of
-     * the two. */
-    let source = match (p.opt_str("url", URL_MAX), p.opt_str("image", IMAGE_MAX)) {
-        (Err(e), _) | (_, Err(e)) => return invalid(call, e),
-        (Ok(Some(_)), Ok(Some(_))) => {
-            return refuse(call, Status::Invalid, "is given with a URL: a VM is made of one image, a URL's or NBS's",
-                          Some("image"));
+    /* What its disk is made of: a cloud's image by its URL, a file directly
+     * under `/images`, or an image of NBS's by its name -- one of the three. */
+    let given = (|| -> Result<_, Invalid> {
+        Ok((p.opt_str("url", URL_MAX)?, p.opt_str("file", store::PATH_MAX)?, p.opt_str("image", IMAGE_MAX)?))
+    })();
+    let (url, file, image) = match given {
+        Ok(given) => given,
+        Err(e) => return invalid(call, e),
+    };
+    let source = match (url, file, image) {
+        (Some(u), None, None) if cloud::is_url(u) => cloud::Source::Url(u),
+        (Some(_), None, None) => {
+            return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url"));
         }
-        (Ok(None), Ok(None)) => {
-            return refuse(call, Status::Invalid, "is wanted -- or an image of NBS's, `image`", Some("url"));
+        (None, Some(f), None) if cloud::is_local(f) => cloud::Source::File(f),
+        (None, Some(_), None) => {
+            return refuse(call, Status::Invalid, "is a file's path directly under /images", Some("file"));
         }
-        (Ok(Some(u)), Ok(None)) if cloud::is_url(u) => cloud::Source::Url(u),
-        (Ok(Some(_)), Ok(None)) => return refuse(call, Status::Invalid, "is an http:// or https:// URL", Some("url")),
-        (Ok(None), Ok(Some(i))) => match i.strip_prefix("nbs:").unwrap_or(i) {
+        (None, None, Some(i)) => match i.strip_prefix("nbs:").unwrap_or(i) {
             "" => return refuse(call, Status::Invalid, "is an image's name", Some("image")),
             i => cloud::Source::Image(i),
         },
+        (None, None, None) => {
+            return refuse(call, Status::Invalid,
+                          "is wanted -- or a local image, `file`, or an image of NBS's, `image`", Some("url"));
+        }
+        (Some(_), None, Some(_)) => {
+            return refuse(call, Status::Invalid, "is given with a URL: a VM is made of one image", Some("image"));
+        }
+        _ => {
+            return refuse(call, Status::Invalid,
+                          "is given with another source: a VM is made of one URL, local file or NBS image",
+                          Some("file"));
+        }
     };
     let windows = match p.opt_str("os", 7) {
         Ok(None | Some("linux")) => false,

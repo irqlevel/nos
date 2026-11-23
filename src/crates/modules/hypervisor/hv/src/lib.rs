@@ -157,9 +157,10 @@ hv start <name|folder>             the vm in the vms' folder of that name, or in
 hv create <name> <kernel> [the words hv start takes]
                                    <name>/vm.toml in the vms' folder, written from them --
                                    the paths the folder's unless they begin with /
-hv create <name> <http(s)://image> [size=N[K|M|G|T]] [password=...] [hvboot=path] [words]
+hv create <name> <http(s)://image|/images/file> [size=N[K|M|G|T]] [password=...] [hvboot=path] [words]
                                    a vm of a cloud's image, qcow2 or raw: downloaded into
-                                   its folder and made its disk, grown to size=; cloud-init
+                                   its folder, or copied from the local image library without
+                                   consuming it, and made its disk, grown to size=; cloud-init
                                    given the keys nos's sshd lets in, and the password; and
                                    a vm.toml booting it by hvboot, on the switch, 1 GiB
 hv create <name> image=nbs:<image> [size=N[K|M|G|T]] [onto=nbs:<volume>] [password=...] [words]

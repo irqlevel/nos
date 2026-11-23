@@ -414,10 +414,11 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         return;
     };
     let rest = rest.as_str();
-    /* A cloud's image, by its URL: downloaded, made a disk, given a seed --
-     * or an image of NBS's (N10d3), cloned into the VM's own volume. */
+    /* A cloud's image, by its URL or from the local image library: made a
+     * disk and given a seed -- or an image of NBS's (N10d3), cloned into the
+     * VM's own volume. */
     let first = rest.split_ascii_whitespace().next().unwrap_or("");
-    if crate::cloud::is_url(first) || crate::cloud::is_image(first) {
+    if crate::cloud::is_url(first) || crate::cloud::is_local(first) || crate::cloud::is_image(first) {
         crate::cloud::command(root, vms, name, first, rest[first.len()..].trim_start(), force, work);
         return;
     }

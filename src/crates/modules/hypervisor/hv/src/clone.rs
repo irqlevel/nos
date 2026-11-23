@@ -355,6 +355,28 @@ impl Fill<'_> {
     }
 }
 
+/// A local raw image copied to a VM's new disk with the same sparse copy as
+/// a clone's. The source is held to read and left untouched; the new file is
+/// in `made` from its create on, so a failed or cancelled copy is removed.
+pub fn copy_raw(from: &str, to: &str, made: &mut Made, work: &mut dyn Work) -> Result<u64, String> {
+    let image = Image::open(from, false)
+        .map_err(|_| alloc::format!("{} could not be held to read -- a guest writes it?", from))?;
+    let size = image.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let data = data_of(&image, from, work)?;
+    let each = Copy { from: String::from(from), to: String::from(to), image, size, data };
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(CHUNK).map_err(|_| String::from("out of memory"))?;
+    buf.resize(CHUNK, 0);
+    let started = kcore::time::boot_time_ns();
+    let mut progress = Progress { done: 0, total: data, started, reported: started };
+    let _ = writeln!(work, "hv: {} -- {} MiB, {} MiB of it data -- into {}", from, size.div_ceil(MIB),
+                     data.div_ceil(MIB), to);
+    kcore::fs::create(to, &[]).map_err(|e| alloc::format!("{} could not be made -- {}", to, e))?;
+    made.files.push(each.to.clone());
+    copy_file(&each, &mut buf, &mut progress, work)?;
+    Ok(size)
+}
+
 /// How far the copy has got, over every file: what of the data has been
 /// read, and when it was last said.
 struct Progress {

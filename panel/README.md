@@ -27,9 +27,10 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
   descriptor gives its values `tones` -- docs/mgmt.md) -- a provider the panel has never heard of gets its
   pages the same way -- the cluster's and NBS's among them, from making
   each on a host of none to its hosts and devices; the VMs' own (a list, a
-  create from a Linux or prepared Windows image by its URL or an image of
-  NBS's, onto a file, a device or a volume of NBS's -- Windows selecting
-  CloudHv with Hyper-V and no cloud-init seed -- a VM's overview -- a snapshot of its volume taken there
+  create from a Linux or prepared Windows image by its URL, a local qcow2 or
+  raw file directly under `/images` on the host, or an image of NBS's, onto a
+  file, a device or a volume of NBS's -- the local source left in place --
+  Windows selecting CloudHv with Hyper-V and no cloud-init seed -- a VM's overview -- a snapshot of its volume taken there
   and its snapshots listed, each a click from a VM of it -- its console in
   xterm.js, its vm.toml, its disks -- each one's IOPS and bandwidth, read and
   written, charted as the vm provider's `disk_io` is asked every two seconds,
@@ -105,7 +106,8 @@ added and reached by the panel's key while one showing another key is not,
 added again once taken away -- its connections of then closed with it --
 and a cluster and an NBS cluster made there, a device given to its chunk
 server and drained; NBS's members removed, added and replaced as jobs; VMs
-made of an image of NBS's and poured onto a volume of it; an image of a URL,
+made of an image of NBS's and poured onto a volume of it; a local image
+selected from `/images` and made a VM without a download; an image of a URL,
 a VM of it, its snapshot from its page and a VM of that, a VM of a file's
 refused -- said, though its name is no field of the form; a VM's disks'
 IOPS and bandwidth charted as it runs, a volume of NBS's among them, and one

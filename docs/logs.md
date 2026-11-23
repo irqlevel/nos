@@ -29,7 +29,8 @@ kernel log.
 ```
 
 `/logs/hv.log` is the hypervisor's (`modules/hypervisor/hv`): what became of
-each VM -- made (`hv create`, from a cloud's image or an image of NBS's),
+each VM -- made (`hv create`, from a cloud's image by URL, a local file in
+`/images` or an image of NBS's),
 cloned, deleted, started (on which CPUs, with what kernel, memory and
 command line), started again, stopped and after how long, and why; a
 start, a make or a clone that failed and why; a move to another host and

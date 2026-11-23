@@ -41,7 +41,9 @@ taken through the API (vm_checks): a VM of hvboot -- which, given no disk,
 says so and powers the guest off -- started as a job, found stopped, its
 console read and streamed, a reader's typing at it refused, an admin's
 refused for a VM that does not run, and stopped; a VM made of an image the
-test serves, cloned, the clone deleted; a protected VM's delete refused
+test serves, cloned, the clone deleted; a local `/images` file listed and
+made a VM without a download, its source kept and a path outside the library
+refused; a protected VM's delete refused
 without force; a Windows image downloaded and started by one job, CloudHv
 with Hyper-V in its vm.toml and no cloud-init disk; and a create of an image
 served slowly cancelled midway, nothing of it left behind. Its fw provider, the host's firewalls (fw_checks):
@@ -156,6 +158,8 @@ def rootfs(tmp, arch, k, rc, panel=None):
         os.makedirs(os.path.join(rootdir, "lib"))
         shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
         shutil.copy(CLOUDHV, os.path.join(rootdir, "lib", "CLOUDHV.fd"))
+        os.makedirs(os.path.join(rootdir, "images"))
+        shutil.copy(os.path.join(tmp, "www", "raw.img"), os.path.join(rootdir, "images", "raw.img"))
     with open(os.path.join(rootdir, "etc", "api", "api.toml"), "w") as f:
         f.write("# api-test.py\nport = %d\nlisten = [\"eth0\"]\nidle_secs = %d\nmax_connections = %d\n"
                 "max_per_key = %d\nmax_handshakes = 2\n" % (PORT, IDLE_SECS, MAX_CONNECTIONS, MAX_PER_KEY))
@@ -634,6 +638,11 @@ def vm_checks(k, pin, port):
     t1 = [v for v in listed.get("vms", []) if v.get("name") == "t1"] if s == 200 else []
     pt.check("the reader lists the vms: t1, off", t1 and t1[0].get("state") == "off" and t1[0].get("folder") is True,
              (s, listed))
+    s, _, library = r.request("POST", "/v1/call/vm/local_images")
+    local = {i.get("path"): i for i in library.get("images", [])} if s == 200 else {}
+    pt.check("a reader lists the local image library by name, path and size",
+             local.get("/images/raw.img", {}).get("name") == "raw.img"
+             and local.get("/images/raw.img", {}).get("size_bytes") == RAW_SIZE, (s, library))
 
     # The host's PCI functions as VMs are given them: none here -- DMA is
     # not translated (no iommu=on) -- each said so, and a function put on a
@@ -730,6 +739,27 @@ def vm_checks(k, pin, port):
              (started, rec))
     started, rec = vm_job(a, "delete", {"name": "c1", "force": True})
     pt.check("and done with it", rec is not None and rec.get("status") == "ok", (started, rec))
+
+    started, rec = vm_job(a, "create", {"name": "local1", "file": "/images/raw.img", "memory_mib": 64})
+    pt.check("a VM made of a file in the local image library, without a download",
+             rec is not None and rec.get("status") == "ok" and rec.get("result", {}).get("disk_bytes") == RAW_SIZE
+             and not any(n.get("text", "").startswith("download:") for n in rec.get("notes", [])), (started, rec))
+    s, got = vm_get(a, "local1")
+    disks = {d.get("file"): d for d in got.get("disks", [])} if s == 200 else {}
+    pt.check("its disk and seed are in its own folder", disks.get("disk.raw", {}).get("size_bytes") == RAW_SIZE
+             and disks.get("seed.iso", {}).get("read_only") is True, got)
+    s, _, library = a.request("POST", "/v1/call/vm/local_images")
+    pt.check("the source is still in the library after a raw create", s == 200
+             and any(i.get("path") == "/images/raw.img" and i.get("size_bytes") == RAW_SIZE
+                     for i in library.get("images", [])), (s, library))
+    started, rec = vm_job(a, "delete", {"name": "local1"})
+    pt.check("and the local VM deleted", rec is not None and rec.get("status") == "ok", (started, rec))
+    started, rec = vm_job(a, "create", {"name": "escape", "file": "/images/../vms/t1/disk.raw"})
+    pt.check("a local source outside /images is refused by its field", rec is not None
+             and rec.get("status") == "invalid" and rec.get("result", {}).get("error", {}).get("field") == "file",
+             (started, rec))
+    s, got = vm_get(a, "escape")
+    pt.check("and nothing was made of it", s == 404, (s, got))
 
     started, rec = vm_job(a, "create", {"name": "win1", "os": "vms", "url": url + "raw.img"})
     pt.check("a guest OS other than linux or windows is refused before a download", rec is not None

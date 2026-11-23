@@ -6,6 +6,10 @@ export const CLOUD_IMAGES = [
   { label: 'Ubuntu 24.04 LTS', url: 'https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img' },
 ];
 
+export interface LocalImage {
+  name: string; path: string; size_bytes: number;
+}
+
 /** A volume of NBS's as the nbs provider's `volumes` lists it. */
 export interface NbsVolume {
   name: string; kind: 'volume' | 'image' | 'snapshot'; size: number; origin: string | null; writer: string | null;

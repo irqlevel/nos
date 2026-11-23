@@ -1,10 +1,13 @@
 //! `hv create <name> <url> [words]`: a VM made of an image, qcow2 or raw,
-//! in a folder of its own, for `hv start <name>` to boot:
+//! in a folder of its own, for `hv start <name>` to boot. The host API also
+//! takes `file`, a path directly under `/images`, and the shell takes that
+//! path too; the local image is never moved or removed:
 //!
-//! - the image downloaded into the folder by the kernel's own HTTP client
-//!   (`kcore::http`: TLS, and the window a download of gigabytes wants),
-//!   made the VM's raw disk (`image::convert`) -- or taken as it is, a raw
-//!   one -- and grown to `size=`;
+//! - the URL's image downloaded into the folder by the kernel's own HTTP
+//!   client (`kcore::http`: TLS, and the window a download of gigabytes
+//!   wants), made the VM's raw disk (`image::convert`) -- or taken as it is,
+//!   a raw one -- and grown to `size=`; a local qcow2 converted into the
+//!   folder and a local raw copied with its holes left out;
 //! - for Linux, cloud-init's NoCloud seed beside it, an ISO 9660 labelled
 //!   cidata (`diskimage::iso`): its meta-data naming the machine, its
 //!   user-data giving the image's own user the keys nos's sshd lets in
@@ -116,6 +119,17 @@ pub fn is_url(word: &str) -> bool {
     word.starts_with("http://") || word.starts_with("https://")
 }
 
+/// Where the host's local image library is. A create names a file directly
+/// in it, never a path elsewhere or one below another directory.
+pub const LOCAL_DIR: &str = "/images";
+
+/// Whether `word` is a path of a file directly under `LOCAL_DIR`.
+pub fn is_local(word: &str) -> bool {
+    word.strip_prefix(LOCAL_DIR).and_then(|rest| rest.strip_prefix('/')).is_some_and(|name| {
+        !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+    })
+}
+
 /// The word `hv create <name>` takes an image of NBS's by (N10d3).
 pub const IMAGE_WORD: &str = "image=nbs:";
 
@@ -149,12 +163,15 @@ pub struct Recipe<'a> {
 }
 
 /// Where a VM's disk comes from: a cloud's image by its URL, downloaded and
-/// made a disk; or an image of NBS's (`image=nbs:<image>`, N10d3), cloned
-/// into a volume of the VM's own -- its name `onto=nbs:<volume>`'s, or the
-/// VM's -- and grown to `size=` where it is given.
+/// made a disk; a file of the host's local image library, converted or
+/// copied without changing the source; or an image of NBS's
+/// (`image=nbs:<image>`, N10d3), cloned into a volume of the VM's own -- its
+/// name `onto=nbs:<volume>`'s, or the VM's -- and grown to `size=` where it
+/// is given.
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
     Url(&'a str),
+    File(&'a str),
     Image(&'a str),
 }
 
@@ -166,11 +183,12 @@ pub struct Created {
     pub keys: usize,
 }
 
-/// `hv create <name> <url> [words]`, its name checked already, and `force`
-/// taken out of its words.
+/// `hv create <name> <url|/images/file> [words]`, its name checked already,
+/// and `force` taken out of its words.
 pub fn command(root: &str, vms: &Vms, name: &str, from: &str, words: &str, force: bool, work: &mut dyn Work) {
     let source = match from.strip_prefix(IMAGE_WORD) {
         Some(image) => Source::Image(image),
+        None if is_local(from) => Source::File(from),
         None => Source::Url(from),
     };
     let made = own_words(words).and_then(|(own, rest)| {
@@ -449,6 +467,7 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, o: Options, wo
     let made = make(root, vms, name, recipe, o, work);
     let (what, from) = match recipe.source {
         Source::Url(url) => ("", url),
+        Source::File(file) => ("the local image ", file),
         Source::Image(image) => ("the image ", image),
     };
     let onto = recipe.onto.unwrap_or("");
@@ -488,7 +507,7 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
                                  reads: give the password in it"));
     }
     /* A clone of an image is grown to size= whatever its name. */
-    if recipe.onto.is_some() && recipe.size.is_some() && matches!(recipe.source, Source::Url(_)) {
+    if recipe.onto.is_some() && recipe.size.is_some() && matches!(recipe.source, Source::Url(_) | Source::File(_)) {
         return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
                                  volume's"));
     }
@@ -515,7 +534,7 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
      * there already -- what `hv delete <vm> keep-disks` leaves -- refused
      * the create that wrote it at the end of a download of gigabytes, every
      * time. */
-    let disk_file = (recipe.onto.is_none() && matches!(recipe.source, Source::Url(_))).then_some(DISK);
+    let disk_file = (recipe.onto.is_none() && matches!(recipe.source, Source::Url(_) | Source::File(_))).then_some(DISK);
     let seed_files = if recipe.windows { [None, None] } else { [Some(SEED), Some(USER_DATA)] };
     for f in [disk_file, seed_files[0], seed_files[1]].into_iter().flatten() {
         let there = store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"))?;
@@ -544,14 +563,14 @@ fn make(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work
             crate::devices::Source::Volume(v) => Some((Onto::Clone(v), String::from(word))),
             _ => return Err(String::from("onto= of a VM of an image is its clone's name, nbs:<volume>")),
         },
-        (Source::Url(_), Some(word)) => match crate::devices::source(word) {
+        (Source::Url(_) | Source::File(_), Some(word)) => match crate::devices::source(word) {
             crate::devices::Source::Volume(v) => Some((Onto::Volume(v), String::from(word))),
             _ => {
                 let (disk, id) = crate::devices::given(word)?;
                 Some((Onto::Device(disk), id))
             }
         },
-        (Source::Url(_), None) => None,
+        (Source::Url(_) | Source::File(_), None) => None,
     };
     let mut theirs = core::mem::take(&mut o.disks);
     let onto_device = match &onto {
@@ -646,41 +665,49 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, fi
     let user_path = join(USER_DATA)?;
     let size = match (recipe.source, onto) {
         (Source::Image(image), Some(Onto::Clone(volume))) => clone_image(image, volume, recipe.size, made, work)?,
-        (Source::Url(url), onto) => {
-            /* The URL's name where the path it makes is one the VFS takes. */
-            let named = image_name(url);
-            let named = if folder.path.len() + 1 + named.len() <= store::PATH_MAX { named } else { IMAGE };
-            let download = join(named)?;
+        (source @ (Source::Url(_) | Source::File(_)), onto) => {
+            let (download, temporary) = match source {
+                Source::Url(url) => {
+                    /* The URL's name where the path it makes is one the VFS takes. */
+                    let named = image_name(url);
+                    let named = if folder.path.len() + 1 + named.len() <= store::PATH_MAX { named } else { IMAGE };
+                    let download = join(named)?;
+                    download_to(url, &download, work)?;
+                    made.files.push(download.clone());
+                    (download, true)
+                }
+                Source::File(path) => (String::from(path), false),
+                Source::Image(_) => return Err(String::from("an image of NBS's has no file to pour")),
+            };
             let disk = join(DISK)?;
-            download_to(url, &download, work)?;
-            made.files.push(download.clone());
 
-            /* Onto a device: poured, the download taken away after. What a pour
-             * that fails or is stopped leaves on the device is the device's -- the
-             * pour says so, once it has written anything. */
+            /* Onto a device: poured, a downloaded source taken away after. A
+             * local source is the image library's and stays where it is. What
+             * a pour that fails or is stopped leaves on the device is the
+             * device's -- the pour says so once it has written anything. */
             let poured = match onto {
                 Some(Onto::Device(disk)) => {
                     let holder = alloc::format!("hv create {}", folder.name);
                     let poured = image::pour(&download, disk, &holder, work)?;
-                    if kcore::fs::remove(&download).is_ok() {
+                    if temporary && kcore::fs::remove(&download).is_ok() {
                         made.files.retain(|f| *f != download);
                     }
                     Some(poured.size + poured.rest)
                 }
                 Some(Onto::Volume(v)) => {
                     let poured = image::pour_volume(&download, v, recipe.force, work)?;
-                    if kcore::fs::remove(&download).is_ok() {
+                    if temporary && kcore::fs::remove(&download).is_ok() {
                         made.files.retain(|f| *f != download);
                     }
                     Some(poured.size + poured.rest)
                 }
                 /* `create` makes a clone of an image alone */
-                Some(Onto::Clone(v)) => return Err(alloc::format!("nbs:{}: a URL's image is poured, not cloned", v)),
+                Some(Onto::Clone(v)) => return Err(alloc::format!("nbs:{}: a file's image is poured, not cloned", v)),
                 None => None,
             };
             match poured {
                 Some(size) => size,
-                None => file_disk(&download, &disk, recipe.size, made, work)?,
+                None => file_disk(&download, &disk, recipe.size, temporary, made, work)?,
             }
         }
         (Source::Image(_), _) => return Err(String::from("a VM of an image has a clone of it for its disk")),
@@ -756,9 +783,11 @@ fn clone_image(image: &str, volume: &str, size: Option<u64>, made: &mut Made, wo
     Ok(size)
 }
 
-/// The download made the folder's disk -- converted, or renamed as it is --
+/// The downloaded or local image made the folder's disk -- converted, a
+/// download renamed as it is, or a local raw copied without consuming it --
 /// and grown to `size`: its size.
-fn file_disk(download: &str, disk: &str, size: Option<u64>, made: &mut Made, work: &mut dyn Work) -> Result<u64, String> {
+fn file_disk(download: &str, disk: &str, size: Option<u64>, temporary: bool, made: &mut Made,
+             work: &mut dyn Work) -> Result<u64, String> {
     let (download, disk) = (String::from(download), String::from(disk));
     /* What it is, by its first bytes: from the heap, the task's stack
      * being 64 KiB. */
@@ -770,15 +799,18 @@ fn file_disk(download: &str, disk: &str, size: Option<u64>, made: &mut Made, wor
         Format::Qcow2 => {
             image::convert(&download, &disk, work)?;
             made.files.push(disk.clone());
-            /* The disk is what the VM has; the image is the download's. */
-            if kcore::fs::remove(&download).is_ok() {
+            /* The disk is what the VM has; a downloaded image is temporary. */
+            if temporary && kcore::fs::remove(&download).is_ok() {
                 made.files.retain(|f| *f != download);
             }
         }
-        Format::Raw => {
+        Format::Raw if temporary => {
             kcore::fs::rename(&download, &disk).map_err(|e| alloc::format!("{} could not become {} -- {}", download, disk, e))?;
             made.files.retain(|f| *f != download);
             made.files.push(disk.clone());
+        }
+        Format::Raw => {
+            crate::clone::copy_raw(&download, &disk, made, work)?;
         }
         format => return Err(image::refused(&download, format)),
     }

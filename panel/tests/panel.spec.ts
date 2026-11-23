@@ -286,6 +286,30 @@ test('a Windows VM: the same image URL job, CloudHv with Hyper-V and no cloud-in
   await expect(page.getByTestId('vm-disks')).not.toContainText('seed.iso');
 });
 
+test('a VM from a local image: /images listed, the chosen path sent without a download', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/ru/h/${host}/vms/new`);
+  await page.getByTestId('source').getByLabel(/Образ из \/images/).check();
+  const file = page.locator('select[name=file]');
+  await expect(file.locator('option')).toContainText([/debian-local\.qcow2/, /alpine-local\.raw/]);
+  await file.selectOption('/images/debian-local.qcow2');
+  await page.fill('input[name=name]', 'local1');
+  const asked = page.waitForRequest((r) => r.method() === 'POST' && r.url().endsWith('/jobs/vm/create'));
+  await page.locator('button[type=submit]').click();
+  const params = (await asked).postDataJSON();
+  expect(params).toMatchObject({ name: 'local1', file: '/images/debian-local.qcow2' });
+  expect(params).not.toHaveProperty('url');
+  expect(params).not.toHaveProperty('image');
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('/images/debian-local.qcow2');
+  await expect(page.getByTestId('job')).not.toContainText('download:');
+
+  await page.goto(`/en/h/${host}/vms/local1`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  await expect(page.getByTestId('vm-disks')).toContainText('disk.raw');
+  await expect(page.getByTestId('vm-disks')).toContainText('seed.iso');
+});
+
 test('a VM made onto a device: its disk the device, one with something on it given only with force', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/new`);
