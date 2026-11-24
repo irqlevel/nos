@@ -34,7 +34,7 @@ const FLAG_LAST: u16 = 1;
 const HDR_LEN: usize = 16;
 const CHUNK_LEN: usize = 1384;
 const REPLY_CAP: usize = 32 * 1024;
-const CMD_MAX: usize = 256;
+const CMD_MAX: usize = 1023;
 const TRUNCATED: &[u8] = b"\n[output truncated]\n";
 
 /// The clients: one on the LAN, one beyond the gateway, one that answers
@@ -147,7 +147,7 @@ fn command(r: &mut Input) -> (String, Option<Vec<u8>>) {
         7 => ("frob a b".to_string(), Some(b"unknown command: frob\n".to_vec())),
         /* A line that fills a line, or is just too long for one. */
         8 => {
-            let n = r.pick(&[CMD_MAX, CMD_MAX + 1, CMD_MAX + 200, 1000]);
+            let n = r.pick(&[CMD_MAX, CMD_MAX + 1, CMD_MAX + 200, 256, 1000]);
             let args = "x".repeat(n - 5);
             let line = format!("echo {}", args);
             let out = if n <= CMD_MAX {
