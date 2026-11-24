@@ -2,8 +2,8 @@
 # install.sh: nos onto this server's disk, from the Linux it runs now -- a
 # provider's rescue system (docs/install.md, "From a provider's rescue
 # system"). It fetches the system image of the release it comes with,
-# checks it against that release's SHA256SUMS, mounts it, and runs the
-# installer in it: the dialog (nos-setup), or nos-install with the arguments
+# checks it against that release's SHA256SUMS, mounts it or unpacks it with
+# unsquashfs, and runs the installer in it: the dialog (nos-setup), or nos-install with the arguments
 # given. https://nos-os.tech/install.sh runs the newest release's:
 #
 #   curl -fsSL https://nos-os.tech/install.sh | sh
@@ -59,7 +59,7 @@ nos_fetch() {
 # tools. $2 is 1 for --panel, whose password's hash needs python3.
 nos_lacks() {
     nos_p=
-    nos_tools="lsblk:util-linux blkid:util-linux e2fsck:e2fsprogs debugfs:e2fsprogs grub-editenv:grub2-common ip:iproute2"
+    nos_tools="lsblk:util-linux blkid:util-linux e2fsck:e2fsprogs debugfs:e2fsprogs grub-editenv:grub2-common ip:iproute2 unsquashfs:squashfs-tools"
     if [ "$1" != other ]; then
         nos_tools="$nos_tools sfdisk:fdisk mkfs.ext4:e2fsprogs mkfs.vfat:dosfstools grub-install:grub2-common udevadm:udev"
         [ -d /usr/lib/grub/i386-pc ] || nos_p="$nos_p grub-pc-bin"
@@ -154,8 +154,12 @@ nos_main() {
     if ! mount -t squashfs -o loop,ro "$nos_dir/$NOS_IMAGE" "$nos_dir/image" 2>/dev/null; then
         modprobe -q squashfs 2>/dev/null || true
         modprobe -q loop 2>/dev/null || true
-        mount -t squashfs -o loop,ro "$nos_dir/$NOS_IMAGE" "$nos_dir/image" ||
-            nos_die "this Linux cannot mount the image: its kernel has no squashfs, or no loop device"
+        if ! mount -t squashfs -o loop,ro "$nos_dir/$NOS_IMAGE" "$nos_dir/image" 2>/dev/null; then
+            nos_say "this Linux cannot mount squashfs; unpacking the image with unsquashfs"
+            rmdir "$nos_dir/image"
+            unsquashfs -no-progress -d "$nos_dir/image" "$nos_dir/$NOS_IMAGE" >/dev/null ||
+                nos_die "this Linux cannot mount the image, and unsquashfs cannot unpack it"
+        fi
     fi
     nos_say "nos $(sed -n 's/^version=//p' "$nos_dir/image/VERSION") ($(sed -n 's/^revision=//p' "$nos_dir/image/VERSION")), sha256 $nos_got"
 
