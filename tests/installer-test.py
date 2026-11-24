@@ -482,7 +482,36 @@ fi
           "rc %d, %r%s" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
 
 
+def download_without_squashfs(tmp):
+    release = os.path.join(tmp, "release")
+    root = os.path.join(release, "root")
+    os.makedirs(root)
+    with open(os.path.join(root, "nos-install"), "w") as f:
+        f.write("#!/bin/sh\necho NOS_INSTALL_OK \"$@\"\n")
+    os.chmod(os.path.join(root, "nos-install"), 0o755)
+    with open(os.path.join(root, "VERSION"), "w") as f:
+        f.write("version=test\nrevision=test\n")
+    script = (
+        "set -eu; "
+        "mksquashfs /tmp/release/root /tmp/release/nos-x86_64.squashfs -no-progress -no-xattrs >/dev/null; "
+        "cd /tmp/release; sha256sum nos-x86_64.squashfs > SHA256SUMS; "
+        "mkdir -p /tmp/fakebin; "
+        "printf '#!/bin/sh\\nexit 1\\n' > /tmp/fakebin/mount; "
+        "cp /tmp/fakebin/mount /tmp/fakebin/modprobe; "
+        "chmod +x /tmp/fakebin/mount /tmp/fakebin/modprobe; "
+        "PATH=/tmp/fakebin:$PATH NOS_RELEASE_URL=file:///tmp/release /src/scripts/installer/install.sh other")
+    p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", release + ":/tmp/release",
+                        "-v", ROOT + ":/src", "nos-builder", "sh", "-c", script],
+                       capture_output=True, text=True, timeout=120)
+    return check("rescue install.sh unpacks the image when squashfs cannot be mounted",
+                 p.returncode == 0 and "unpacking the image with unsquashfs" in p.stdout
+                 and "nos test (test)" in p.stdout and "NOS_INSTALL_OK other" in p.stdout,
+                 "rc %d, stdout %r, stderr %r" % (p.returncode, p.stdout[-2000:], p.stderr[-1000:]))
+
+
 def run(tmp, image):
+    if not download_without_squashfs(tmp):
+        return
     network_found(tmp)
     panel_choices(tmp)
     key = os.path.join(tmp, "id_test")
