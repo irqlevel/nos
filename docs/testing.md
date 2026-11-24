@@ -1026,7 +1026,13 @@ gateway is the one), one with `gateway4:`, one of DHCP alone (nothing),
 ifupdown's with a netmask, NetworkManager's, systemd-networkd's, and a
 quoted ifcfg; and the gateway offered where none is found, the network's
 first address. A gateway misread is a nos that boots unreachable, which
-looks like an install that worked. Then an ISO built with
+looks like an install that worked. The panel choice is driven through
+`nos-setup`'s interactive and unattended paths in the same Alpine, with
+`whiptail`, the other dialog steps and `nos-install` stood in for: interactive
+Yes and `panel=yes` must pass `--panel`; interactive No, `panel=no` and no
+answer must leave it out. The rescue installer's dependencies must include
+python3 for the dialog and `--panel`, not for a plain disk install, and the
+ISO must carry python3 for the panel's password. Then an ISO built with
 answers -- the disk by `/dev/disk/by-id`, `wipe=yes`, a root of 1G, the
 test's key, a netconsole, a static address (QEMU's user network's, given as
 a network with no DHCP server's), `after=poweroff` -- boots from a CD under SeaBIOS,

@@ -1,10 +1,10 @@
 #!/bin/bash
 # nos-setup: the nos installer's dialog (scripts/installer, docs/install.md,
 # "From an ISO", "From a provider's rescue system"). It asks which disk, how
-# big nos's root, what network and which keys, shows what will be written,
-# and has the disk's name typed to go on -- then hands it all to the
-# nos-install of the system image beside it, nos-install disk, which checks
-# everything again and writes.
+# big nos's root, what network, which keys and whether to install the panel,
+# shows what will be written and has the disk's name typed to go on -- then
+# hands it all to the system image's nos-install disk, which checks everything
+# again and writes.
 #
 # It runs in one of two places. On the installer ISO -- /etc/nos-installer
 # is the ISO's -- in its own Linux, on its console: it mounts the image the
@@ -70,7 +70,7 @@ add_answer() {
     case "$k" in
         key) KEYS+=("$v") ;;
         key_url) KEY_URLS+=("$v") ;;
-        disk|wipe|root_size|ip|gw|dns|netconsole|cmdline|after) ANS[$k]=$v ;;
+        disk|wipe|root_size|ip|gw|dns|netconsole|cmdline|panel|after) ANS[$k]=$v ;;
         *) say "answers: there is no answer called $k -- left out" ;;
     esac
 }
@@ -469,9 +469,9 @@ eject_media() {
 }
 
 # nos-install disk with what was answered or chosen: DISK, ROOT_SIZE,
-# WIPE, the network (NOS_NET: /etc/net.toml's), NETCONSOLE, NOS_CMDLINE and
-# the keys -- its lines on the screen and in the kernel log. $1 "--dry-run"
-# only says what it would write
+# WIPE, the network (NOS_NET: /etc/net.toml's), NETCONSOLE, NOS_CMDLINE,
+# PANEL and the keys -- its lines on the screen and in the kernel log. $1
+# "--dry-run" only says what it would write
 run_install() {
     local args=(disk "$DISK" --root-size "$ROOT_SIZE") line
     [ "$WIPE" = 0 ] || args+=(--wipe)
@@ -479,6 +479,7 @@ run_install() {
     args+=(${NOS_NET[@]+"${NOS_NET[@]}"})
     [ -z "$NETCONSOLE" ] || args+=(--netconsole "$NETCONSOLE")
     [ -z "$NOS_CMDLINE" ] || args+=(--cmdline "$NOS_CMDLINE")
+    [ "$PANEL" = 0 ] || args+=(--panel)
     [ -z "${1:-}" ] || args+=("$1")
     say "nos-install ${args[*]}"
     nos_install "${args[@]}" 2>&1 | while IFS= read -r line; do
@@ -498,6 +499,7 @@ NOS_NET=(--dhcp)
 # More kernel parameters (the answers' cmdline=)
 NOS_CMDLINE=
 NETCONSOLE=
+PANEL=0
 
 # nos's network a static address: IP, GW, DNS
 net_static_chosen() {
@@ -544,6 +546,7 @@ unattended() {
     [ "${ANS[wipe]:-no}" != yes ] || WIPE=1
     NETCONSOLE=${ANS[netconsole]:-}
     NOS_CMDLINE=${ANS[cmdline]:-}
+    [ "${ANS[panel]:-no}" != yes ] || PANEL=1
     wait_carrier || say "network: no card has a link"
     if [ -n "${ANS[ip]:-}" ]; then
         if ! valid_cidr "${ANS[ip]}" || ! valid_ip "${ANS[gw]:-}" || ! valid_ip "${ANS[dns]:-}"; then
@@ -869,6 +872,14 @@ ask_keys() {
     done
 }
 
+ask_panel() {
+    if whiptail --title "$TITLE" --defaultno --yesno "Install the management panel?\n\nAt nos's first boot, a VM is created from Debian's cloud image and the panel's bundle, both downloaded. The panel then manages nos in a browser at https://<server>:39233.\n\nThe installer prints root's panel password once." 16 76; then
+        PANEL=1
+    else
+        PANEL=0
+    fi
+}
+
 ask_netconsole() {
     local v
     v=$(dialog_ --inputbox "Send nos's kernel log over UDP to a collector? IP:PORT, or leave it empty.\n\nOn a server whose console is its network, it is how a boot that dies is seen (docs/netconsole.md)." 12 76 "$NETCONSOLE") || return 1
@@ -948,7 +959,7 @@ interactive() {
         : > "$KEYS_FILE"
         chmod 600 "$KEYS_FILE"
         WIPE=1
-        if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && confirm; then
+        if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && ask_panel && confirm; then
             clear
             if run_install; then
                 the_end "$(done_text)" installed

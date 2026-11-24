@@ -14,6 +14,10 @@ wipe=yes
 # it, nos-data: for the VMs' disks and NBS.
 root_size=10G
 
+# The management panel: a VM made at nos's first boot, which manages nos in a
+# browser at https://<server>:39233. Left out, no panel is installed.
+#panel=yes
+
 # The keys nos's sshd lets in: ssh-ed25519 only. As many key= lines as you
 # like, and key_url= lines that give such keys (a GitHub user's .keys).
 key=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExam you@laptop

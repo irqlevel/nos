@@ -172,6 +172,11 @@ The server's default boot entry does not change.
 
 ### The management panel
 
+The interactive installer, both from `curl ... | sh` and from the ISO, asks
+**Install the management panel?** The default is **No**; choosing **Yes** has
+the same effect as `--panel` below. An ISO built with answers takes
+`panel=yes`; left out or `panel=no`, no panel is installed.
+
 `--panel` gives the machine the management panel: a VM of nos's own, which
 manages it in a browser ([The management panel](api.md#the-management-panel)).
 nos-install makes root's password for it, prints it once with where the panel
@@ -190,7 +195,8 @@ panel's bundle -- the release's, which the image names in `/lib/panel/bundle`
 -- and makes the VM; the panel is up once its VM has installed it, minutes
 later, its certificate the one `api panel` prints the fingerprint of. An
 update with `--panel` keeps the password there is. `python3` is needed for
-the hash (`hashlib.scrypt`).
+the hash (`hashlib.scrypt`): the ISO carries it, and the one-line installer
+installs it with the other missing packages where apt-get is available.
 
 ## Booting nos
 
@@ -411,11 +417,12 @@ image's `nos-install disk`. It boots by BIOS or UEFI; its menu:
 
 The dialog asks which disk -- every one Linux sees, each said with its
 model, serial and size, what it holds and whether nos can read it -- how big
-nos's root is to be, the network, and the keys sshd is to let in: pasted,
-or fetched by URL or as a GitHub user's (`https://github.com/<user>.keys`),
-their fingerprints shown. Then what `nos-install disk --dry-run` would write,
-and the disk's name typed to erase it. When it is done: take the ISO out of
-the virtual media and reboot -- under UEFI the firmware is told to boot the
+nos's root is to be, the network, the keys sshd is to let in (pasted, or
+fetched by URL or as a GitHub user's `https://github.com/<user>.keys`, their
+fingerprints shown), and whether to install the management panel. Then what
+`nos-install disk --dry-run` would write, and the disk's name typed to erase
+it. When it is done: take the ISO out of the virtual media and reboot --
+under UEFI the firmware is told to boot the
 disk (above).
 
 The network first offers what a Linux already on the server's disks is set
@@ -449,7 +456,8 @@ scripts/installer/build.sh --answers answers    # one that asks nothing
 An ISO built with answers ([`answers.example`](../scripts/installer/answers.example))
 installs with no questions, as a fleet's is: the disk by its
 `/dev/disk/by-id` name, `wipe=yes`, the root's size, the keys or their URLs,
-a static address, netconsole, kernel parameters, and what to do after --
+a static address, netconsole, kernel parameters, `panel=yes` where wanted,
+and what to do after --
 `poweroff` unless told, `reboot` (the virtual CD ejected first where the BMC
 lets it be), or stay. What it does goes to the screen and, at the level
 every console shows, to the kernel log: a `netconsole=` given to the

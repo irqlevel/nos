@@ -375,8 +375,116 @@ def network_found(tmp):
     check("a netmask is its prefix's length", got.get("mask_bits") == "26 16", got.get("mask_bits"))
 
 
+PANEL_FUNCTIONS = ("add_answer", "run_install", "unattended", "ask_panel", "interactive")
+
+
+def panel_choices(tmp):
+    """The dialog and the answers, with nos-install and everything outside
+    the panel choice stood in for: what command each choice runs."""
+    print("--- the management panel choice", flush=True)
+    where = os.path.join(tmp, "panel")
+    os.makedirs(where)
+    fns = shell_functions(os.path.join(ROOT, "scripts", "installer", "nos-setup"), PANEL_FUNCTIONS)
+    lacks = shell_functions(os.path.join(ROOT, "scripts", "installer", "install.sh"), ("nos_lacks",))
+    if not check("nos-setup has " + ", ".join(PANEL_FUNCTIONS), fns is not None):
+        return
+    if not check("install.sh has nos_lacks", lacks is not None):
+        return
+    with open(os.path.join(where, "fns.sh"), "w") as f:
+        f.write(fns)
+    with open(os.path.join(where, "lacks.sh"), "w") as f:
+        f.write(lacks)
+    with open(os.path.join(where, "run.sh"), "w") as f:
+        f.write(r"""set -uo pipefail
+mode=$1
+choice=$2
+. /n/fns.sh
+TITLE="nos installer"
+ON_ISO=0
+KMSG_LEVEL=6
+LOG=/tmp/nos-setup.log
+DONE=/tmp/nos-setup.done
+KEYS_FILE=/tmp/nos-keys
+ROOT_SIZE_DEFAULT=10G
+DISK=/dev/test
+ROOT_SIZE=10G
+WIPE=0
+NOS_NET=(--dhcp)
+NOS_CMDLINE=
+NETCONSOLE=
+PANEL=0
+RESCUE_LINE=
+declare -A ANS=([disk]=/dev/test [wipe]=yes [after]=stay)
+KEYS=()
+KEY_URLS=()
+say() { :; }
+kmsg() { :; }
+image_version() { echo test; }
+wait_carrier() { :; }
+net_dhcp_chosen() { NOS_NET=(--dhcp); }
+net_dhcp() { :; }
+gather_keys() { : > "$KEYS_FILE"; }
+keys_count() { echo 0; }
+in_vm() { return 1; }
+nos_install() {
+    printf 'INSTALL'
+    printf ' %s' "$@"
+    printf '\n'
+}
+clear() { :; }
+ask_disk() { :; }
+ask_root_size() { :; }
+ask_network() { :; }
+ask_keys() { :; }
+ask_netconsole() { :; }
+confirm() { :; }
+done_text() { echo done; }
+the_end() { exit 0; }
+whiptail() { [ "$choice" = yes ]; }
+if [ "$mode" = dialog ]; then
+    interactive
+else
+    [ "$choice" = default ] || add_answer panel "$choice"
+    unattended
+fi
+""")
+    p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", where + ":/n",
+                        INSTALLER_ALPINE, "sh", "-c",
+                        "apk add -q bash >/dev/null && "
+                        "bash /n/run.sh dialog yes && bash /n/run.sh dialog no && "
+                        "bash /n/run.sh answers yes && bash /n/run.sh answers no && "
+                        "bash /n/run.sh answers default && "
+                        "sh -c '. /n/lacks.sh; echo DIALOG=$(nos_lacks dialog 0); "
+                        "echo PANEL=$(nos_lacks disk 1); echo PLAIN=$(nos_lacks disk 0)'"],
+                       capture_output=True, text=True, timeout=600)
+    got = [line for line in p.stdout.splitlines() if line.startswith("INSTALL ")]
+    plain = "INSTALL disk /dev/test --root-size 10G --wipe --dhcp"
+    enabled = plain + " --panel"
+    check("the dialog's Yes and panel=yes pass --panel",
+          p.returncode == 0 and len(got) == 5 and got[0] == enabled and got[2] == enabled,
+          "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
+    check("the dialog's No, panel=no and no answer leave --panel out",
+          p.returncode == 0 and len(got) == 5 and got[1] == plain and got[3] == plain and got[4] == plain,
+          "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
+
+    def lacked(kind):
+        prefix = kind + "="
+        for line in p.stdout.splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix):].split()
+        return []
+
+    check("the rescue installer requires python3 for the dialog and --panel",
+          p.returncode == 0 and "python3" in lacked("DIALOG") and "python3" in lacked("PANEL"),
+          "rc %d, %r%s" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
+    check("a rescue disk install without --panel does not require python3",
+          p.returncode == 0 and "python3" not in lacked("PLAIN"),
+          "rc %d, %r%s" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
+
+
 def run(tmp, image):
     network_found(tmp)
+    panel_choices(tmp)
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "installer-test", "-f", key], check=True)
     answers = os.path.join(tmp, "answers")
@@ -393,6 +501,13 @@ def run(tmp, image):
     print("".join("  " + line + "\n" for line in (p.stdout + p.stderr).splitlines()[-10:]), end="", flush=True)
     if not check("build.sh makes the ISO, with the answers", p.returncode == 0 and os.path.exists(iso)):
         return
+    packages = []
+    packages_path = os.path.join(ROOT, "out", "installer", "packages.txt")
+    if os.path.exists(packages_path):
+        with open(packages_path) as f:
+            packages = f.read().splitlines()
+    check("the installer ISO carries python3 for the panel's password",
+          "python3" in packages, packages)
     with open(os.path.join(tmp, "disk.raw"), "wb") as f:
         f.truncate(DISK_SIZE)
     m = Machine(tmp, key)

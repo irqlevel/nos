@@ -1,12 +1,14 @@
 # The installer's Alpine packages (mkiso.sh): what nos-setup and the image's
 # nos-install run -- nos-install disk's tools, GRUB for BIOS and UEFI both,
-# whiptail -- and the kernel that runs them, with its modules: every disk,
+# whiptail, python3 for the panel's password -- and the kernel that runs them,
+# with its modules: every disk,
 # network card and keyboard Linux has a driver for
 alpine-baselayout
 alpine-release
 busybox
 eudev
 bash
+python3
 coreutils
 findutils
 grep

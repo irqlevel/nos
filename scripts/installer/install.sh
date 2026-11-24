@@ -56,6 +56,7 @@ nos_fetch() {
 # packages that have it: for $1 "other" -- update, boot, status, rollback --
 # e2fsprogs, GRUB's grub-editenv and efibootmgr; for "disk" also what makes
 # a disk, GRUB for BIOS and UEFI among it; for "dialog" also the dialog's
+# tools. $2 is 1 for --panel, whose password's hash needs python3.
 nos_lacks() {
     nos_p=
     nos_tools="lsblk:util-linux blkid:util-linux e2fsck:e2fsprogs debugfs:e2fsprogs grub-editenv:grub2-common ip:iproute2"
@@ -65,6 +66,9 @@ nos_lacks() {
         [ -d /usr/lib/grub/x86_64-efi ] || nos_p="$nos_p grub-efi-amd64-bin"
     fi
     [ "$1" != dialog ] || nos_tools="$nos_tools whiptail:whiptail ssh-keygen:openssh-client curl:curl"
+    if [ "$1" = dialog ] || [ "${2:-0}" = 1 ]; then
+        nos_tools="$nos_tools python3:python3"
+    fi
     for nos_t in $nos_tools; do
         command -v "${nos_t%%:*}" >/dev/null 2>&1 || nos_p="$nos_p ${nos_t#*:}"
     done
@@ -77,7 +81,7 @@ nos_lacks() {
 }
 
 nos_packages() {
-    nos_lack=$(nos_lacks "$1")
+    nos_lack=$(nos_lacks "$1" "${2:-0}")
     [ -n "$nos_lack" ] || return 0
     if [ "${NOS_NO_PACKAGES:-0}" = 1 ] || ! command -v apt-get >/dev/null 2>&1; then
         nos_say "this system lacks $nos_lack -- nos-install says what it cannot do without"
@@ -118,17 +122,21 @@ nos_main() {
     # No arguments: the dialog, on the terminal -- not on stdin, which curl | sh
     # gives this script itself
     nos_dialog=0
+    nos_panel=0
+    for nos_arg in "$@"; do
+        [ "$nos_arg" != --panel ] || nos_panel=1
+    done
     if [ $# = 0 ]; then
         nos_dialog=1
         # true, not ":": a redirection that fails ends a non-interactive sh
         # at a special builtin, before the || is reached
         { true < /dev/tty; } 2>/dev/null ||
             nos_die "the dialog needs a terminal: in an SSH session with one (ssh -t), or give nos-install's arguments (docs/install.md)"
-        nos_packages dialog
+        nos_packages dialog "$nos_panel"
     else
         case "$1" in
-            disk) nos_packages disk ;;
-            update|boot|status|rollback) nos_packages other ;;
+            disk) nos_packages disk "$nos_panel" ;;
+            update|boot|status|rollback) nos_packages other "$nos_panel" ;;
         esac
     fi
 
