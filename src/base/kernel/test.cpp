@@ -3038,7 +3038,7 @@ public:
     }
 
 private:
-    static const ulong ROW_MAX = 256;
+    static const ulong ROW_MAX = 2 * LineEditor::LINE_LEN_MAX + 64;
 
     char row_[ROW_MAX + 1];
     ulong len_;

@@ -28,8 +28,9 @@ namespace kernel
 class LineEditor final
 {
 public:
-    /* The longest line taken: what is typed past it is dropped */
-    static const ulong LINE_LEN_MAX = 80;
+    /* The longest line taken, as the command dispatcher's: what is typed
+       past it is dropped */
+    static const ulong LINE_LEN_MAX = 1023;
     /* Lines Up, Down and ^R go back through */
     static const ulong HISTORY_MAX = 32;
 

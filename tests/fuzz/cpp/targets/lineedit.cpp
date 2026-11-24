@@ -293,6 +293,10 @@ const char KEYS[] = {CR, LF, BS, DEL, CTRL_C, CTRL_G, CTRL_N, CTRL_P, CTRL_R, CT
                      'A', 'B', 'C', 'D', '1', ';', '\t', 0};
 const char LETTERS[] = "ab c";
 
+/* The boot and SSH tests take a line to LINE_LEN_MAX. Random key runs keep
+   their old budget rather than multiplying the gate's cost by that limit. */
+const size_t KEY_RUN_MAX = 160;
+
 char next_key(fuzz::Input& in)
 {
     switch (in.below(8))
@@ -318,9 +322,9 @@ void run(fuzz::Input& in)
 
     while (in.more())
     {
-        /* Now and then a run of one key: a line past LINE_LEN_MAX, a history
-           past HISTORY_MAX, Up past its oldest line */
-        size_t times = in.chance(16) ? in.range(1, 2 * LineEditor::LINE_LEN_MAX) : 1;
+        /* Now and then a run of one key: a long line, a history past
+           HISTORY_MAX, Up past its oldest line */
+        size_t times = in.chance(16) ? in.range(1, KEY_RUN_MAX) : 1;
         char c = next_key(in);
         if (times > 1)
             fuzz::reached("a run of one key");

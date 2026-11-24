@@ -332,6 +332,12 @@ class Test:
               rc == 0 and len(re.findall(r"^\d+\.\d+\r?$", out, re.M)) == 2 and
               len(re.findall(r"nos \S+ \(", out)) == 2 and "(reverse-i-search)'vers': version" in out,
               repr(out[-600:]))
+        long_line = "write /ssh-long-line.txt "
+        text = "u" * (1023 - len(long_line))
+        script = (long_line + text + "\rstat /ssh-long-line.txt\rrm /ssh-long-line.txt\rexit\r").encode()
+        rc, out, _ = self.ssh([], stdin=script, tty=True)
+        check("a 1023-character command reaches the shell whole",
+              rc == 0 and "/ssh-long-line.txt: file, %d bytes" % len(text) in out, repr(out[-300:]))
         rc, out, _ = self.ssh([], stdin=b"uptime\nversion\n")
         check("a shell without one: no prompt, EOF ends it", rc == 0 and uptime_like(out) and "$ " not in out,
               repr(out[-300:]))

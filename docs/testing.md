@@ -133,7 +133,7 @@ another such run pass, its sleeper moving after 9 ms.
 ([line editing](shell-commands.md#line-editing)) on a screen of text and
 Backspace, as the console is: lines run and kept, Up and Down through them
 to the line being typed, ^R's search -- found, found again, failed, made
-shorter, given up with ^G, kept to be edited -- ^C and ^U, a line past 80
+shorter, given up with ^G, kept to be edited -- ^C and ^U, a line past 1,023
 characters and a history past 32 lines, each step held to what the screen
 must show; `cpp-fuzz.py`'s `lineedit` target holds it to a model over random
 keys.
@@ -844,8 +844,8 @@ Needs Docker and openssl; a minute, more under emulation.
 
 End to end against OpenSSH's own client (see [sshd](sshd.md)). On arm64 it
 loads `sshd.ko` over the UDP shell and has `ssh` work it: commands, a shell
-with a terminal and one without, Up and ^R through a terminal's history,
-3 MiB of output through the client's window
+with a terminal and one without, Up and ^R through a terminal's history, a
+1,023-character command kept whole, 3 MiB of output through the client's window
 with rekeys in the middle, a command that prints nothing for five seconds
 while the client asks every second whether the server is there (`ssh -o
 ServerAliveInterval=1 -o ServerAliveCountMax=2 ... top 5000` -- a session
@@ -2182,8 +2182,9 @@ own, TCP's flags in combinations that mean something. The targets:
   lost with its connection by design;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
-  that lines repeat and a search finds them, with runs of one key past the
-  longest line and the history's end. Every key is held to a model of the
+  that lines repeat and a search finds them, with bounded runs of one key for
+  long lines and the history's end; the end-to-end test takes a line to the
+  exact 1,023-character limit. Every key is held to a model of the
   editor: the line Enter runs, a logout on ^D on an empty line and on
   nothing else, and what a terminal of one row shows once it has acted on
   the echo -- text, CR, LF, Backspace, erase to the end of the line and
@@ -2942,8 +2943,9 @@ what its header says it does:
 - `lineedit`: the console shell's line editor (`kernel/line_editor.cpp`),
   what a terminal on the serial port types at it: any byte, weighted to the
   keys it acts on and a few letters, so that lines repeat and a search finds
-  them, with runs of one key past the longest line and the history's end.
-  Every key is held to a model in `std::string`: the line Enter hands the
+  them, with bounded runs of one key for long lines and the history's end;
+  the boot test takes a line to the exact 1,023-character limit. Every key is
+  held to a model in `std::string`: the line Enter hands the
   shell, and what the screen shows -- built from the editor's output, text
   and Backspace alone, as the console's is -- the prompt and the line, or
   the search's prompt, its query and what it found, exactly; a Backspace on

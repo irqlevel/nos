@@ -144,7 +144,7 @@ is edited with the same keys:
 A line of nothing but spaces is not kept, nor the same line twice running.
 The console's history is its own and each SSH session's is its own; none
 outlives the boot. Over SSH, ^L also clears the screen and ^D on an empty
-line logs out. A console line is at most 80 characters, an SSH one 255.
+line logs out. A console or SSH line is at most 1,023 characters.
 
 The keyboards send what a terminal would -- an arrow as ESC [ A..D, Ctrl and
 a letter as its control byte -- so the console's editor
