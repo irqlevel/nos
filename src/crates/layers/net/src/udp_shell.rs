@@ -45,8 +45,8 @@ const CHUNK_LEN: usize = 1384;
 /// stack is 32 KiB.
 const REPLY_CAP: usize = 32 * 1024;
 
-/// What a command line fits in.
-const CMD_MAX: usize = 256;
+/// One datagram carries a command line, up to the dispatcher's own limit.
+const CMD_MAX: usize = 1023;
 
 /// The gap between two reply datagrams.
 const PACE_MS: u64 = 1;

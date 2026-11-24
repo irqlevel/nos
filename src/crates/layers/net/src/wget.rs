@@ -16,11 +16,7 @@ use fs::vfs::{Open, MAX_PATH, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE};
 use crate::device::DEVICES;
 use crate::http::{self, Response, MAX_URL_LEN};
 
-/// The longest URL a command line can carry (the UDP shell takes 255-byte
-/// commands, the console 80). Redirect targets run far longer -- a GitHub
-/// release link becomes ~900 characters -- but those never pass through
-/// here: the client keeps them in its own buffers.
-const MAX_ARG_URL: usize = 256;
+const MAX_ARG_URL: usize = MAX_URL_LEN;
 
 /// What the body is written to the file in.
 const WRITE_BUF: usize = 64 * 1024;
