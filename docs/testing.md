@@ -1032,7 +1032,10 @@ looks like an install that worked. The panel choice is driven through
 Yes and `panel=yes` must pass `--panel`; interactive No, `panel=no` and no
 answer must leave it out. The rescue installer's dependencies must include
 python3 for the dialog and `--panel`, not for a plain disk install, and the
-ISO must carry python3 for the panel's password. With `mount` and `modprobe`
+ISO must carry python3 for the panel's password. A clean Arch Linux container
+(`quay.io/archlinux/archlinux:latest`) runs the rescue installer's package setup: pacman must install its
+dialog and disk tools, including both GRUB targets and `libnewt`'s whiptail.
+With `mount` and `modprobe`
 forced to fail, `install.sh` must instead unpack a small, checksummed release
 with `unsquashfs` and run its `nos-install`. Then an ISO built with
 answers -- the disk by `/dev/disk/by-id`, `wipe=yes`, a root of 1G, the

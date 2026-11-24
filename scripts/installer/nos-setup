@@ -992,7 +992,7 @@ here_ready() {
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
     done
     if [ -n "$missing" ]; then
-        echo "nos-setup: this Linux has no$missing (Debian, Ubuntu: apt-get install whiptail curl openssh-client)" >&2
+        echo "nos-setup: this Linux has no$missing (Debian, Ubuntu: apt-get install whiptail curl openssh-client; Arch: pacman -S libnewt curl openssh)" >&2
         return 1
     fi
 }
