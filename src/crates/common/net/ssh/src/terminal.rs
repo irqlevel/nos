@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// The longest line taken: what the kernel runs a command line of at most.
-pub const LINE_MAX: usize = 255;
+pub const LINE_MAX: usize = 1023;
 /// Lines Up, Down and ^R go back through.
 pub const HISTORY_MAX: usize = 32;
 

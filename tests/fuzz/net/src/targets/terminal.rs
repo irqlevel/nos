@@ -17,6 +17,10 @@
 
 use ssh::terminal::{Action, Editor, HISTORY_MAX, LINE_MAX, SEARCH, SEARCH_END, SEARCH_FAILED};
 
+/* The SSH end-to-end test takes a line to LINE_MAX. Random key runs keep
+   their old budget rather than multiplying the gate's cost by that limit. */
+const KEY_RUN_MAX: u64 = 160;
+
 use crate::Input;
 
 const PROMPT: &str = "nos$ ";
@@ -345,9 +349,9 @@ pub fn terminal(r: &mut Input) {
     screen.echo(PROMPT.as_bytes());
 
     while r.more() {
-        /* Now and then a run of one key: a line past LINE_MAX, a history
-           past HISTORY_MAX, Up past its oldest line */
-        let times = if r.chance(16) { r.range(1, 2 * LINE_MAX as u64) } else { 1 };
+        /* Now and then a run of one key: a long line, a history past
+           HISTORY_MAX, Up past its oldest line */
+        let times = if r.chance(16) { r.range(1, KEY_RUN_MAX) } else { 1 };
         let b = next_key(r);
         if times > 1 {
             crate::common::runner::reached("terminal: a run of one key");
