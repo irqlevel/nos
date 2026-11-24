@@ -482,6 +482,44 @@ fi
           "rc %d, %r%s" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
 
 
+def arch_rescue(tmp):
+    """A rescue Arch gets the same tools as a rescue Debian, by pacman."""
+    print("--- the rescue installer on Arch", flush=True)
+    where = os.path.join(tmp, "arch")
+    os.makedirs(where)
+    fns = shell_functions(os.path.join(ROOT, "scripts", "installer", "install.sh"),
+                          ("nos_say", "nos_lacks", "nos_arch_packages", "nos_packages"))
+    if not check("install.sh has its Arch package path", fns is not None):
+        return
+    with open(os.path.join(where, "fns.sh"), "w") as f:
+        f.write(fns)
+    with open(os.path.join(where, "run.sh"), "w") as f:
+        f.write(r"""set -eu
+. /n/fns.sh
+# Pacman's downloader sandbox cannot run under Docker Desktop's emulation.
+pacman() { command pacman --disable-sandbox "$@"; }
+echo "ARCH_NAMES=$(nos_arch_packages 'grub2-common grub-pc-bin grub-efi-amd64-bin whiptail openssh-client python3 fdisk udev util-linux')"
+nos_packages dialog 0
+missing=0
+for t in whiptail curl ssh-keygen python3 grub-install grub-editenv unsquashfs lsblk blkid sfdisk mkfs.ext4 mkfs.vfat ip udevadm; do
+    command -v "$t" >/dev/null 2>&1 || { echo "MISSING $t"; missing=1; }
+done
+for d in i386-pc x86_64-efi; do
+    [ -f "/usr/lib/grub/$d/modinfo.sh" ] || { echo "MISSING grub $d"; missing=1; }
+done
+[ "$missing" = 0 ] && echo ARCH_RESCUE_OK
+""")
+    p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", where + ":/n",
+                        "quay.io/archlinux/archlinux:latest", "sh", "/n/run.sh"],
+                       capture_output=True, text=True, timeout=900)
+    check("Arch package names cover GRUB, whiptail, SSH, Python, fdisk and udev",
+          "ARCH_NAMES=grub libnewt openssh python systemd util-linux" in p.stdout,
+          "rc %d, stdout %r, stderr %r" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
+    check("Arch rescue installs every dialog and disk tool with pacman",
+          p.returncode == 0 and "ARCH_RESCUE_OK" in p.stdout,
+          "rc %d, stdout %r, stderr %r" % (p.returncode, p.stdout[-2000:], p.stderr[-1000:]))
+
+
 def download_without_squashfs(tmp):
     release = os.path.join(tmp, "release")
     root = os.path.join(release, "root")
@@ -512,6 +550,7 @@ def download_without_squashfs(tmp):
 def run(tmp, image):
     if not download_without_squashfs(tmp):
         return
+    arch_rescue(tmp)
     network_found(tmp)
     panel_choices(tmp)
     key = os.path.join(tmp, "id_test")

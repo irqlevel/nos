@@ -11,9 +11,8 @@
 #       --network-here --ssh-key /root/.ssh/authorized_keys
 #
 # What the install runs and this system lacks -- GRUB for BIOS and UEFI,
-# mkfs, efibootmgr, the dialog's whiptail -- is installed first where
-# apt-get is (Debian, Ubuntu: the rescue systems of most providers), and
-# named elsewhere. Environment:
+# mkfs, efibootmgr, the dialog's whiptail -- is installed first with apt-get
+# (Debian, Ubuntu) or pacman (Arch), and named elsewhere. Environment:
 #
 #   NOS_VERSION=vX.Y.Z    that release's image, not this script's
 #   NOS_RELEASE_URL=URL   a directory holding nos-x86_64.squashfs and its
@@ -80,14 +79,43 @@ nos_lacks() {
     done | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
+# nos_lacks names Debian's packages; Arch's that carry the same tools.
+nos_arch_packages() {
+    for nos_p in $1; do
+        case "$nos_p" in
+            grub2-common|grub-pc-bin|grub-efi-amd64-bin) nos_p=grub ;;
+            whiptail) nos_p=libnewt ;;
+            openssh-client) nos_p=openssh ;;
+            python3) nos_p=python ;;
+            fdisk) nos_p=util-linux ;;
+            udev) nos_p=systemd ;;
+        esac
+        echo "$nos_p"
+    done | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
 nos_packages() {
     nos_lack=$(nos_lacks "$1" "${2:-0}")
     [ -n "$nos_lack" ] || return 0
-    if [ "${NOS_NO_PACKAGES:-0}" = 1 ] || ! command -v apt-get >/dev/null 2>&1; then
+    nos_manager=
+    if command -v apt-get >/dev/null 2>&1; then
+        nos_manager=apt-get
+    elif command -v pacman >/dev/null 2>&1; then
+        nos_manager=pacman
+        nos_lack=$(nos_arch_packages "$nos_lack")
+    fi
+    if [ "${NOS_NO_PACKAGES:-0}" = 1 ] || [ -z "$nos_manager" ]; then
         nos_say "this system lacks $nos_lack -- nos-install says what it cannot do without"
         return 0
     fi
     nos_say "installing what the install needs: $nos_lack"
+    if [ "$nos_manager" = pacman ]; then
+        # shellcheck disable=SC2086 # a word a package
+        if ! pacman -Sy --needed --noconfirm $nos_lack >/dev/null; then
+            nos_say "pacman did not install all of it -- nos-install says what it cannot do without"
+        fi
+        return 0
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1 || true
     # shellcheck disable=SC2086 # a word a package
     if ! DEBIAN_FRONTEND=noninteractive apt-get -y -qq install --no-install-recommends $nos_lack >/dev/null; then

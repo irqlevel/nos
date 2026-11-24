@@ -196,7 +196,7 @@ panel's bundle -- the release's, which the image names in `/lib/panel/bundle`
 later, its certificate the one `api panel` prints the fingerprint of. An
 update with `--panel` keeps the password there is. `python3` is needed for
 the hash (`hashlib.scrypt`): the ISO carries it, and the one-line installer
-installs it with the other missing packages where apt-get is available.
+installs it with the other missing packages where apt-get or pacman is available.
 
 ## Booting nos
 
@@ -361,9 +361,10 @@ system's own terminal, with two differences:
 - **The keys** root logs in with there (`/root/.ssh/authorized_keys`, its
   `ssh-ed25519` ones) are offered, beside the ISO's paste, URL and GitHub.
 
-What the install runs and the rescue system lacks -- GRUB for BIOS and UEFI
-(`grub-pc-bin`, `grub-efi-amd64-bin`), mkfs, `efibootmgr`, `whiptail` -- is
-installed with apt-get first, where it has one; elsewhere it is named, and
+What the install runs and the rescue system lacks -- GRUB for BIOS and UEFI,
+mkfs, `efibootmgr`, `whiptail` -- is installed first with apt-get on Debian
+and Ubuntu (`grub-pc-bin`, `grub-efi-amd64-bin`, `whiptail`), or with pacman
+on Arch (`grub`, `libnewt`). Elsewhere the missing packages are named, and
 `nos-install` refuses what it cannot do without. Arguments after `sh -s --`
 are `nos-install`'s, and there is no dialog:
 
