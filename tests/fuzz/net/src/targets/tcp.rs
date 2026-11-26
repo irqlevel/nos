@@ -1043,8 +1043,8 @@ pub fn tcp(r: &mut Input) {
     if let Some(l) = allow_listener {
         check_allow(l, &w.peers.allow, peer_ip, r);
     }
-    /* Now and then the second device, which nothing listens on: the
-     * hypervisor's switch, with a guest behind it. */
+    /* Now and then the second device: the hypervisor's switch, with a guest
+     * behind it. Before the traffic starts, one port listens on both devices. */
     let guest = if r.u8() < 96 {
         net::register("eth1", ETH1_MAC, &crate::machine::nic::DRIVERS[1], (), ()).inspect(|eth1| {
             eth1.set_ip(ETH1_IP);
@@ -1053,6 +1053,16 @@ pub fn tcp(r: &mut Input) {
     } else {
         None
     };
+    if let Some(eth1) = guest {
+        invariant!(TCP.listen(&nic, LISTEN_PORTS[0]).is_none(),
+                   "a second listener on one device's port was allowed");
+        let second = TCP.listen(&eth1, LISTEN_PORTS[0]);
+        invariant!(second.is_some(), "one port could not listen on two devices");
+        if let Some(l) = second {
+            TCP.close(l);
+        }
+        crate::common::runner::reached("tcp: one port listened on two devices");
+    }
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
                          next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest,
                          churn_port: CHURN_PORT_BASE };

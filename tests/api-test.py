@@ -2,7 +2,7 @@
 """api-test: the host API module (modules/mgmt/api) and nosctl, end to end.
 
 nos boots under QEMU with api.ko, modtest.ko and sshd.ko on its root, an
-api.toml that listens on eth0 (hv0 is the default, and the panel's), and two
+api.toml that listens on eth0 (on x86-64, on hv0 at the same time), and two
 clients' keys in /etc/api/clients -- an admin's and a reader's, made by
 `nosctl keygen` -- and a third key, a stranger's, that is in no file. Then,
 through nosctl's own client:
@@ -160,9 +160,10 @@ def rootfs(tmp, arch, k, rc, panel=None):
         shutil.copy(CLOUDHV, os.path.join(rootdir, "lib", "CLOUDHV.fd"))
         os.makedirs(os.path.join(rootdir, "images"))
         shutil.copy(os.path.join(tmp, "www", "raw.img"), os.path.join(rootdir, "images", "raw.img"))
+    listeners = '["eth0", "hv0"]' if arch == "x86_64" else '["eth0"]'
     with open(os.path.join(rootdir, "etc", "api", "api.toml"), "w") as f:
-        f.write("# api-test.py\nport = %d\nlisten = [\"eth0\"]\nidle_secs = %d\nmax_connections = %d\n"
-                "max_per_key = %d\nmax_handshakes = 2\n" % (PORT, IDLE_SECS, MAX_CONNECTIONS, MAX_PER_KEY))
+        f.write("# api-test.py\nport = %d\nlisten = %s\nidle_secs = %d\nmax_connections = %d\n"
+                "max_per_key = %d\nmax_handshakes = 2\n" % (PORT, listeners, IDLE_SECS, MAX_CONNECTIONS, MAX_PER_KEY))
     with open(os.path.join(rootdir, "etc", "api", "clients"), "w") as f:
         f.write("%s admin admin\n%s read reader\n" % (k["admin"][2], k["reader"][2]))
     if rc:
@@ -929,6 +930,9 @@ def panel_checks(k, pin, log):
     allow = {e.get("nic"): e.get("networks") for e in status.get("allow", [])} if s == 200 else {}
     pt.check("and its address alone on hv0, from the next connection on", allow.get("hv0") == [PANEL_IP + "/32"],
              (s, allow))
+    listeners = {e.get("nic"): e.get("state") for e in status.get("listeners", [])} if s == 200 else {}
+    pt.check("the API listens on eth0 and hv0 at once",
+             listeners.get("eth0") == "listening" and listeners.get("hv0") == "listening", (s, listeners))
     started, rec = vm_job(a, "delete", {"name": "panel"})
     pt.check("the panel's VM is not deleted without force", rec is not None and rec.get("status") == "conflict",
              (started, rec))
