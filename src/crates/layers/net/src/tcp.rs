@@ -3966,7 +3966,7 @@ impl Tcp {
              * and the pool keeps its slots. */
             let backlog = usize::from(pool.slots[listener].backlog);
             let buffers = pool.slots[listener].buffers;
-            if self.backlog_full(&pool, local_port, backlog) {
+            if self.backlog_full(&pool, nic, local_port, backlog) {
                 return;
             }
 
@@ -4055,16 +4055,18 @@ impl Tcp {
         }
     }
 
-    /// Whether the port's listener holds all the connections it may that
-    /// nobody has accepted -- `backlog`, its own. The caller holds the pool
-    /// lock and no connection's: whether one is waiting to be accepted is
-    /// its own state, read under its own lock, and the pool says which slots
-    /// are worth asking.
-    fn backlog_full(&'static self, pool: &Pool, port: u16, backlog: usize) -> bool {
+    /// Whether the device's listener on the port holds all the connections
+    /// it may that nobody has accepted -- `backlog`, its own. The caller
+    /// holds the pool lock and no connection's: whether one is waiting to be
+    /// accepted is its own state, read under its own lock, and the pool says
+    /// which slots are worth asking.
+    fn backlog_full(&'static self, pool: &Pool, nic: &Nic, port: u16, backlog: usize) -> bool {
         let mut pending = 0;
         for i in 0..MAX_CONNECTIONS {
             let slot = &pool.slots[i];
-            if !slot.used || slot.listening || slot.local_port != port {
+            if !slot.used || slot.listening || slot.local_port != port
+                || !slot.device.is_some_and(|d| d.is(nic))
+            {
                 continue;
             }
 
@@ -4345,8 +4347,11 @@ impl Tcp {
 
         let mut pool = self.pool.lock();
 
-        /* A second listener on the same port would never be given anything */
-        if pool.slots.iter().any(|slot| slot.used && slot.listening && slot.local_port == port) {
+        /* On one device a second listener on the port would never be given
+         * anything. Another device has connections of its own. */
+        if pool.slots.iter().any(|slot| {
+            slot.used && slot.listening && slot.local_port == port && slot.device.is_some_and(|d| d.is(nic))
+        }) {
             drop(pool);
             klog!(0, "tcp: port {} is listened on already", port);
             return None;
@@ -4380,16 +4385,16 @@ impl Tcp {
     pub fn accept(&'static self, listener: &'static Conn, timeout_ms: u64)
         -> Option<&'static Conn>
     {
-        /* The port, taken once: a close from another task frees the slot,
-         * and a later listen may take it for another port. */
+        /* The device and port, taken once: a close from another task frees
+         * the slot, and a later listen may take it for another port. */
         let listener_index = self.index_of(listener)?;
-        let port = {
+        let (port, nic) = {
             let pool = self.pool.lock();
             let slot = &pool.slots[listener_index];
             if !slot.used || !slot.listening {
                 return None;
             }
-            slot.local_port
+            (slot.local_port, slot.device?)
         };
 
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
@@ -4406,17 +4411,21 @@ impl Tcp {
             let pool = self.pool.lock();
 
             let slot = &pool.slots[listener_index];
-            if !slot.used || !slot.listening || slot.local_port != port {
+            if !slot.used || !slot.listening || slot.local_port != port
+                || !slot.device.is_some_and(|d| d.is(&nic))
+            {
                 return None;
             }
 
             for i in 0..MAX_CONNECTIONS {
-                /* The pool says which slots arrived on this port; whether one
-                 * is waiting to be accepted is its own to say. Never one of
-                 * this machine's own connections that happens to use the
-                 * port: those are owned from the start. */
+                /* The pool says which slots arrived on this device and port;
+                 * whether one is waiting to be accepted is its own to say.
+                 * Never one of this machine's own connections that happens to
+                 * use the port: those are owned from the start. */
                 let slot = &pool.slots[i];
-                if !slot.used || slot.listening || slot.local_port != port {
+                if !slot.used || slot.listening || slot.local_port != port
+                    || !slot.device.is_some_and(|d| d.is(&nic))
+                {
                     continue;
                 }
 
@@ -4774,6 +4783,7 @@ impl Tcp {
             return false;
         }
         let port = pool.slots[index].local_port;
+        let nic = pool.slots[index].device.expect("a TCP listener has a device");
 
         {
             let mut inner = conn.inner.lock();
@@ -4782,14 +4792,14 @@ impl Tcp {
         }
         pool.free(index);
 
-        self.reset_unaccepted(pool, port);
+        self.reset_unaccepted(pool, &nic, port);
         true
     }
 
-    /// Every connection on the port that nobody accepted is reset. Takes the
-    /// pool's guard and lets go of it: the resets go out once the lock is
-    /// down.
-    fn reset_unaccepted(&'static self, pool: PreemptSpinGuard<'static, Pool>, port: u16) {
+    /// Every connection on the device's port that nobody accepted is reset.
+    /// Takes the pool's guard and lets go of it: the resets go out once the
+    /// lock is down.
+    fn reset_unaccepted(&'static self, pool: PreemptSpinGuard<'static, Pool>, nic: &Nic, port: u16) {
         /* What each reset goes out with, taken from the slots rather than
          * sent from them: by the time the lock is down the cleanup timer may
          * have handed those slots on. */
@@ -4816,7 +4826,9 @@ impl Tcp {
          * one's. */
         for i in 0..MAX_CONNECTIONS {
             let slot = &pool.slots[i];
-            if !slot.used || slot.listening || slot.local_port != port {
+            if !slot.used || slot.listening || slot.local_port != port
+                || !slot.device.is_some_and(|d| d.is(nic))
+            {
                 continue;
             }
 
