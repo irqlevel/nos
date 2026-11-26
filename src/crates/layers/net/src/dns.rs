@@ -12,6 +12,7 @@ use kcore::time;
 use kcore::klog;
 
 use crate::abi;
+use crate::device::DEVICES;
 use crate::udp;
 
 pub const SERVER_PORT: u16 = 53;
@@ -463,8 +464,9 @@ fn skip_name(packet: &[u8], at: usize) -> Option<usize> {
 }
 
 /// The DNS server this machine was given: the resolver's while it runs,
-/// else the one the DHCP lease named. 0 for none -- no lease, or one that
-/// named no server. What the hypervisor's guests are handed as theirs.
+/// else the default interface's DHCP lease's, then another ready lease's.
+/// 0 for none -- no lease, or one that named no server. What the
+/// hypervisor's guests are handed as theirs.
 /// Allocates nothing, from any context: what has not been made has nothing
 /// to say.
 pub fn upstream() -> u32 {
@@ -472,7 +474,20 @@ pub fn upstream() -> u32 {
     if resolver != 0 {
         return resolver;
     }
-    abi::dhcp_if_made().map_or(0, |dhcp| if dhcp.is_ready() { dhcp.lease().dns } else { 0 })
+    if let Some(dhcp) = DEVICES.default_device().and_then(abi::dhcp_if_made) {
+        if dhcp.is_ready() && dhcp.lease().dns != 0 {
+            return dhcp.lease().dns;
+        }
+    }
+    for index in 0..DEVICES.count() {
+        let Some(dev) = DEVICES.at(index) else { continue };
+        if let Some(dhcp) = abi::dhcp_if_made(dev) {
+            if dhcp.is_ready() && dhcp.lease().dns != 0 {
+                return dhcp.lease().dns;
+            }
+        }
+    }
+    0
 }
 
 /// `upstream`, for a module: host byte order, 0 for none.

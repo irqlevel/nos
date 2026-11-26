@@ -375,6 +375,57 @@ def network_found(tmp):
     check("a netmask is its prefix's length", got.get("mask_bits") == "26 16", got.get("mask_bits"))
 
 
+NETWORK_HERE_FUNCTIONS = ("network_here_is_multi", "network_here_summary", "network_here_toml", "put_ssh_nic")
+
+
+def network_here(tmp):
+    """The two-link server's records become nos's per-interface net.toml."""
+    print("--- two links in --network-here", flush=True)
+    where = os.path.join(tmp, "network-here")
+    os.makedirs(where)
+    fns = shell_functions(os.path.join(ROOT, "scripts", "nos-install"), NETWORK_HERE_FUNCTIONS)
+    if not check("nos-install has " + ", ".join(NETWORK_HERE_FUNCTIONS), fns is not None):
+        return
+    data = """default|eth1
+dns|77.88.8.8
+nic|eth0|dhcp|10.0.0.4/24|10.0.0.1|etx1
+nic|eth1|static|94.126.205.237/31|94.126.205.236|etx2
+route|eth0|10.0.0.0/8|10.0.0.1
+route|eth0|172.16.0.0/12|10.0.0.1
+route|eth0|192.168.0.0/16|10.0.0.1
+"""
+    with open(os.path.join(where, "fns.sh"), "w") as f:
+        f.write(fns)
+    with open(os.path.join(where, "data"), "w") as f:
+        f.write(data)
+    with open(os.path.join(where, "run.sh"), "w") as f:
+        f.write("set -u\n. /n/fns.sh\ndata=$(cat /n/data)\n"
+                "network_here_summary \"$data\"\n"
+                "network_here_is_multi \"$data\"\n"
+                "network_here_toml \"$data\"\n"
+                "mkdir -p /n/etc\n"
+                "printf 'sshd start\\n' > /n/etc/rc\n"
+                "NET_MODE=multi NET_DEFAULT=eth1\n"
+                "say() { printf '%s\\n' \"$*\"; }\n"
+                "put_ssh_nic /n\n"
+                "cat /n/etc/rc\n")
+    p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", where + ":/n",
+                        INSTALLER_ALPINE, "sh", "-c", "apk add -q bash >/dev/null && bash /n/run.sh"],
+                       capture_output=True, text=True, timeout=600)
+    want = """ip=94.126.205.237/31 gw=94.126.205.236 dns=77.88.8.8
+dhcp_eth0 = true
+ip_eth1 = \"94.126.205.237/31\"
+gw_eth1 = \"94.126.205.236\"
+dns = \"77.88.8.8\"
+default = \"eth1\"
+route_eth0 = [\"10.0.0.0/8 via 10.0.0.1\", \"172.16.0.0/12 via 10.0.0.1\", \"192.168.0.0/16 via 10.0.0.1\"]
+/etc/rc: sshd start 22 nic=eth1, the default route's interface
+sshd start 22 nic=eth1
+"""
+    check("two links keep DHCP inside, static /31 outside, private routes and external sshd",
+          p.returncode == 0 and p.stdout == want, "rc %d, got %r, want %r%s" % (p.returncode, p.stdout, want, p.stderr[-500:]))
+
+
 PANEL_FUNCTIONS = ("add_answer", "run_install", "unattended", "ask_panel", "interactive")
 
 
@@ -552,6 +603,7 @@ def run(tmp, image):
         return
     arch_rescue(tmp)
     network_found(tmp)
+    network_here(tmp)
     panel_choices(tmp)
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "installer-test", "-f", key], check=True)

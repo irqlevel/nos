@@ -1,5 +1,5 @@
-//! The layer's single instances, and the few names it is called by from
-//! outside Rust.
+//! The layer's single instances, one DHCP client per device, and the few
+//! names it is called by from outside Rust.
 //!
 //! There used to be fifty more of those names here: one per call a C++ view
 //! of the layer made. The views are gone and so are they. What is left is
@@ -9,6 +9,7 @@
 //! is linked on its own.
 
 use alloc::boxed::Box;
+use crate::device::{Device, DEVICES, MAX_DEVICES};
 use crate::nic::Nic;
 use kcore::once::OnceBox;
 use kcore::klog;
@@ -24,7 +25,7 @@ use crate::udp_shell::UdpShell;
 static ARP: OnceBox<ArpTable> = OnceBox::new();
 static ICMP: OnceBox<Icmp> = OnceBox::new();
 static DNS: OnceBox<Dns> = OnceBox::new();
-static DHCP: OnceBox<Dhcp> = OnceBox::new();
+static DHCP: [OnceBox<Dhcp>; MAX_DEVICES] = [const { OnceBox::new() }; MAX_DEVICES];
 static NAT: OnceBox<Nat> = OnceBox::new();
 static UDP_SHELL: OnceBox<UdpShell> = OnceBox::new();
 
@@ -58,25 +59,34 @@ pub(crate) fn dns() -> Option<&'static Dns> {
     }
 }
 
-pub(crate) fn dhcp() -> Option<&'static Dhcp> {
-    match DHCP.get_or_try_init(|| Dhcp::new().map(Box::new)) {
+pub(crate) fn dhcp(dev: &'static Device) -> Option<&'static Dhcp> {
+    match DHCP[dev.slot()].get_or_try_init(|| Dhcp::new().map(Box::new)) {
         Some(dhcp) => Some(dhcp),
         None => {
-            klog!(0, "dhcp: no memory for the client");
+            klog!(0, "dhcp: no memory for a client");
             None
         }
     }
 }
 
-/// The resolver and the DHCP client if anything has made them yet: for a
-/// question that must not be what makes them -- one asked from where
+/// The resolver and a device's DHCP client if anything has made them yet:
+/// for a question that must not be what makes them -- one asked from where
 /// nothing may allocate.
 pub(crate) fn dns_if_made() -> Option<&'static Dns> {
     DNS.get()
 }
 
-pub(crate) fn dhcp_if_made() -> Option<&'static Dhcp> {
-    DHCP.get()
+pub(crate) fn dhcp_if_made(dev: &'static Device) -> Option<&'static Dhcp> {
+    DHCP[dev.slot()].get()
+}
+
+pub(crate) fn dhcp_stop_all() {
+    for index in 0..DEVICES.count() {
+        let Some(dev) = DEVICES.at(index) else { continue };
+        if let Some(client) = dhcp_if_made(dev) {
+            client.stop();
+        }
+    }
 }
 
 pub(crate) fn nat() -> Option<&'static Nat> {

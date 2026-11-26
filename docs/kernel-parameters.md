@@ -18,7 +18,7 @@ The defaults the shipped configs use are `dhcp=auto dns=on root=auto
 fstest=on` on the x86-64 ISO, `console=serial dhcp=auto dns=on root=auto` on
 the disk image, `dhcp=auto dns=on root=auto` on arm64 (`scripts/qemu-arm64.sh`),
 and `root=UUID=<partition> dhcp=auto dns=on` on a server the system image is
-poured onto ([Install](install.md)) -- where eth0's settings are its root's
+poured onto ([Install](install.md)) -- where the interfaces' settings are its root's
 `/etc/net.toml` and not those words (Networking, below). None of them starts the UDP shell: it
 runs any command for anyone who can send the machine a datagram, so it is on
 only where `udpshell=` is given -- `nos-install --udpshell`,
@@ -60,16 +60,18 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 
 ## Networking
 
-eth0's settings -- its address, gateway, DNS server and DHCP -- are
-`/etc/net.toml`'s on the root where there is one: what `nos-install` writes
-on a server ([The network](install.md#the-network)), read once the root is
-mounted and before anything sends. `ip=`, `gw=`, `dns=` and `dhcp=` are what
-a boot with no such file goes by -- an ISO's, QEMU's, a test's, a root that
-was not found, a kernel from before the file -- and one whose file is
-refused, which the boot says with the file's line. Where the file is taken
-they are not used, and the boot names them (`net: the command line's ... not
-used`). The network layer reads both (`layers/net/src/settings.rs`), through
-the same checks; `net` says which it took.
+The interfaces' settings -- static addresses or DHCP, the default route,
+additional routes and the resolver -- are `/etc/net.toml`'s on the root
+where there is one: what `nos-install` writes on a server ([The
+network](install.md#the-network)), read once the root is mounted and before
+anything sends. `ip=`, `gw=`, `dns=` and `dhcp=` are what a boot with no
+such file goes by -- an ISO's, QEMU's, a test's, a root that was not found,
+a kernel from before the file -- and one whose file is refused, which the
+boot says with the file's line. They configure eth0 alone. Where the file
+is taken they are not used, and the boot names them (`net: the command
+line's ... not used`). The network layer reads both
+(`layers/net/src/settings.rs`), through the same checks; `net` says which
+it took.
 
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot
 - `dhcp=off` — disable DHCP entirely (even via shell command)
@@ -77,7 +79,7 @@ the same checks; `net` says which it took.
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `ip=A.B.C.D/N` — a static address on `eth0` and its prefix length, for a network with no DHCP server. It is put on `eth0` as the network's services start, before the netconsole sends a line, and `dhcp=auto` then leaves `eth0` alone. Refused, with a line in the log, without a prefix, with one past 32, for the subnet's own network or broadcast address (up to /30), and for 0.0.0.0/8, loopback, multicast and class E
 - `gw=A.B.C.D` — the default gateway for `ip=`: another address of its subnet. One off the subnet, or given without `ip=`, is named in the log and dropped
-- `dns=A.B.C.D` — a resolver on that server from the start, on `eth0`, whether the address is static or a lease's to come (whose own server then does not replace it). `dns=on` keeps taking the lease's
+- `dns=A.B.C.D` — a resolver on that server from the start, on the default route's interface, whether the address is static or a lease's to come (whose own server then does not replace it). `dns=on` keeps taking the lease's
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
 - `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/layers/net/src/device.rs`)

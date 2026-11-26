@@ -480,6 +480,15 @@ impl Device {
         self.identity.get().map_or([0; 6], |identity| identity.mac)
     }
 
+    pub(crate) fn eth_index(&self) -> Option<usize> {
+        let name = self.name();
+        if !(4..=5).contains(&name.len()) || &name[..3] != b"eth" || !name[3..].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let index = name[3..].iter().fold(0usize, |n, b| n * 10 + usize::from(b - b'0'));
+        (index < MAX_DEVICES).then_some(index)
+    }
+
     pub fn ip(&self) -> u32 {
         self.ip.load(Ordering::Acquire)
     }
@@ -504,14 +513,21 @@ impl Device {
         self.gw.store(gw, Ordering::Release);
     }
 
-    /// What to ask ARP for to reach `dst`: the gateway when it is off the
-    /// subnet, `dst` itself when it is on it.
+    /// What to ask ARP for to reach `dst`: the gateway of an additional
+    /// route through this device, else its gateway when `dst` is off the
+    /// subnet, and `dst` itself when it is on it.
     pub fn route_ip(&self, dst: u32) -> u32 {
         let (mask, gw) = (self.mask.load(Ordering::Acquire), self.gw.load(Ordering::Acquire));
-        if mask != 0 && gw != 0 && (dst & mask) != (self.ip() & mask) {
-            gw
-        } else {
+        let connected = mask != 0 && self.ip() != 0 && (dst & mask) == (self.ip() & mask);
+        if let Some(route) = self.eth_index().and_then(|index| crate::settings::route_for_dev(index, dst)) {
+            if !connected || route.mask.count_ones() > mask.count_ones() {
+                return route.gw;
+            }
+        }
+        if connected || mask == 0 || gw == 0 {
             dst
+        } else {
+            gw
         }
     }
 
@@ -519,6 +535,11 @@ impl Device {
     /// table, which `DeviceTable::by_handle` turns back into the device.
     pub(crate) fn handle(&self) -> usize {
         self as *const Device as usize
+    }
+
+    /// The table slot, for a service each device has one of.
+    pub(crate) fn slot(&self) -> usize {
+        (self as *const Device as usize - DEVICES.devices.as_ptr() as usize) / core::mem::size_of::<Device>()
     }
 }
 
@@ -1211,19 +1232,55 @@ impl DeviceTable {
         self.devices[..self.count()].iter().find(|dev| dev.name() == name)
     }
 
-    /// The device whose subnet `dst` is on -- `hv0` for a guest of the
-    /// hypervisor's -- or None when it is on none of them, and so for the
-    /// default device's gateway.
-    pub fn on_subnet(&'static self, dst: u32) -> Option<&'static Device> {
-        self.devices[..self.count()].iter().find(|dev| {
-            let mask = dev.mask.load(Ordering::Acquire);
-            mask != 0 && dev.ip() != 0 && dst & mask == dev.ip() & mask
-        })
+    pub fn find_eth(&'static self, index: usize) -> Option<&'static Device> {
+        let mut name = [0u8; ETH_NAME_MAX];
+        let len = Self::eth_name(&mut name, index);
+        self.find(&name[..len])
     }
 
-    /// The device the default route is on -- the first with an address and
-    /// a gateway, `not` aside: where NAT sends what is behind `not`.
+    /// The interface the settings give the default route, eth0 for the
+    /// original one-interface configuration.
+    pub fn default_device(&'static self) -> Option<&'static Device> {
+        self.find_eth(crate::settings::default_index())
+    }
+
+    /// The most specific connected or additional route, then the configured
+    /// default route. A connected route wins a tie of prefix lengths.
+    pub fn route(&'static self, dst: u32) -> Option<&'static Device> {
+        let connected = self.on_subnet(dst);
+        if let Some(route) = crate::settings::route_for(dst) {
+            let more_specific = connected.is_none_or(|dev| route.mask.count_ones() > dev.mask().count_ones());
+            if more_specific {
+                if let Some(dev) = self.find_eth(route.dev) {
+                    return Some(dev);
+                }
+            }
+        }
+        connected.or_else(|| self.default_device())
+    }
+
+    /// The device whose subnet `dst` is on -- `hv0` for a guest of the
+    /// hypervisor's -- or None when it is on none of them. The most specific
+    /// subnet wins where two contain it.
+    pub fn on_subnet(&'static self, dst: u32) -> Option<&'static Device> {
+        self.devices[..self.count()].iter().filter(|dev| {
+            let mask = dev.mask.load(Ordering::Acquire);
+            mask != 0 && dev.ip() != 0 && dst & mask == dev.ip() & mask
+        }).reduce(|best, dev| if dev.mask().count_ones() > best.mask().count_ones() { dev } else { best })
+    }
+
+    /// The device the default route is on, `not` aside: where NAT sends what
+    /// is behind `not`. A multi-interface configuration never falls back to
+    /// another uplink when its chosen one is not ready.
     pub fn uplink(&'static self, not: &Device) -> Option<&'static Device> {
+        if let Some(dev) = self.default_device() {
+            if !core::ptr::eq(dev, not) && dev.ip() != 0 && dev.gw() != 0 {
+                return Some(dev);
+            }
+            if crate::settings::is_multi() {
+                return None;
+            }
+        }
         self.devices[..self.count()].iter().find(|dev| {
             !core::ptr::eq(*dev, not) && dev.ip() != 0 && dev.gw() != 0
         })

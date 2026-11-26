@@ -989,8 +989,11 @@ the root's `/etc/net.toml`, the kernel parameters left as they were, and
 broadcast address, a gateway off the subnet or with no address, a loopback
 address, a multicast resolver, `--ip` with `--dhcp`, `ip=` in `--cmdline`
 -- are refused before anything is written. Every install and update writes
-eth0's settings: `install` and `disk` an `/etc/net.toml` of DHCP, which the
-booted nos's `net` says it took; an `update` of an install from before the
+the interfaces' settings: `install` and `disk` an `/etc/net.toml` of DHCP,
+which the booted nos's `net` says it took. A further boot has two virtio
+NICs on different user networks: DHCP on eth0 inside, a static address and
+the default route on eth1 outside, an additional private route, and sshd
+answering through the second NIC only. An `update` of an install from before the
 file -- its network `ip= gw= dns=` in the grubenv, its kernel one that does
 not read the file -- writes the file from those words and keeps them for
 the kernel kept for a rollback, the next boot on the file's static
@@ -1026,7 +1029,10 @@ gateway is the one), one with `gateway4:`, one of DHCP alone (nothing),
 ifupdown's with a netmask, NetworkManager's, systemd-networkd's, and a
 quoted ifcfg; and the gateway offered where none is found, the network's
 first address. A gateway misread is a nos that boots unreachable, which
-looks like an install that worked. The panel choice is driven through
+looks like an install that worked. `--network-here`'s own functions then
+turn the two-link server's records into the whole per-interface file: DHCP
+on eth0, a static /31 and default route on eth1, all three private routes,
+and sshd on eth1; the old one-line summary is unchanged. The panel choice is driven through
 `nos-setup`'s interactive and unattended paths in the same Alpine, with
 `whiptail`, the other dialog steps and `nos-install` stood in for: interactive
 Yes and `panel=yes` must pass `--panel`; interactive No, `panel=no` and no
@@ -2000,8 +2006,10 @@ own, TCP's flags in combinations that mean something. The targets:
   the datagrams numbered with no gap of the machine's making, each line at
   most once, in order, and all of it in the end but what the ring says it
   dropped;
-- `netconf`: eth0's settings -- `/etc/net.toml` and the command line's
-  `ip=`, `gw=`, `dns=`, `dhcp=` (`layers/net/src/settings.rs`): files made
+- `netconf`: every interface's settings -- `/etc/net.toml` and the command
+  line's `ip=`, `gw=`, `dns=`, `dhcp=` for eth0 (`layers/net/src/settings.rs`):
+  a directed two-link case (DHCP inside, a static /31 and default route
+  outside, three private routes), and files made
   of lines a person might write, well and badly, or bytes of any kind, and
   command lines of words, held to a model of the rules that shares nothing
   with the module -- an address made from its parts and judged by them --

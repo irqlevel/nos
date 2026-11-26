@@ -760,7 +760,7 @@ ask_network_here() {
         dhcp)
             whiptail --title "$TITLE" --defaultno --yesno "nos asks a DHCP server for its address at every boot. On a network with no DHCP server -- many dedicated servers' have none -- it boots unreachable.\n\nIs there a DHCP server on this server's network, for the server itself (not only the rescue system's)?" 14 76 || return 1
             return 0 ;;
-        here) IP=$hip; GW=$hgw; DNS=$hdns ;;
+        here) NOS_NET=(--network-here); return 0 ;;
         found)
             set -- $found
             IP=$1; GW=${2/#-/}; DNS=${3/#-/} ;;

@@ -277,9 +277,9 @@ pub fn wget(args: &str, out: &mut Output) {
         return;
     }
 
-    let dev = match DEVICES.find(b"eth0") {
+    let dev = match DEVICES.default_device() {
         Some(dev) => dev,
-        None => { let _ = writeln!(out, "eth0 not found"); return; }
+        None => { let _ = writeln!(out, "no default network device"); return; }
     };
     let nic = dev.as_nic();
 
@@ -456,7 +456,7 @@ pub fn fetch(url: &str, path: &str, progress: &mut dyn FnMut(u64, u64) -> bool) 
     if url.is_empty() || url.len() >= MAX_URL_LEN {
         return Err(Fetch::Url);
     }
-    let dev = DEVICES.find(b"eth0").ok_or(Fetch::NoDevice)?;
+    let dev = DEVICES.default_device().ok_or(Fetch::NoDevice)?;
     let nic = dev.as_nic();
     let vfs = fs::vfs_instance().ok_or(Fetch::Create)?;
     if path.is_empty() || path.len() >= MAX_PATH {

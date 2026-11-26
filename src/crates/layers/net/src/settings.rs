@@ -1,21 +1,26 @@
-//! eth0's settings -- its address, its gateway, its resolver, and whether it
-//! asks DHCP for them -- from `/etc/net.toml` on the root filesystem: what
-//! nos-install writes as it installs, and what is edited afterwards (`edit
-//! /etc/net.toml`, then a reboot). In the strict TOML `conf` reads:
+//! Every interface's settings from `/etc/net.toml` on the root filesystem:
+//! what nos-install writes as it installs, and what is edited afterwards
+//! (`edit /etc/net.toml`, then a reboot). The original keys are eth0's:
 //!
-//!     # A network with no DHCP server
 //!     ip = "203.0.113.5/24"
 //!     gw = "203.0.113.1"
 //!     dns = "203.0.113.53"
 //!
-//! or `dhcp = true`, which is also what a file without `ip` means: an
-//! address asked of DHCP as the boot starts, and the lease's resolver --
-//! or, with `dns` beside it, a resolver on that server from the start.
-//! `dhcp = false` without an `ip` leaves eth0 with no address until the
-//! `dhcp` command is run. The file is taken whole or not at all: a key it
-//! does not have, a value that is not one, a gateway off the address's
-//! subnet, `dhcp = true` beside an `ip` -- each is refused with its line, and
-//! the boot says so.
+//! or `dhcp = true`, which is also what a file without `ip` means. The
+//! per-interface form names the NIC in each key, the default route and any
+//! additional routes:
+//!
+//!     dhcp_eth0 = true
+//!     ip_eth1 = "94.126.205.237/31"
+//!     gw_eth1 = "94.126.205.236"
+//!     default = "eth1"
+//!     dns = "77.88.8.8"
+//!     route_eth0 = ["10.0.0.0/8 via 10.0.0.1"]
+//!
+//! The file is taken whole or not at all: a key it does not have, a value
+//! that is not one, a gateway off the address's subnet, overlapping static
+//! subnets, `dhcp = true` beside an `ip` -- each is refused, and the boot
+//! says so.
 //!
 //! A boot with no such file -- an ISO's, QEMU's, a test's, one whose root
 //! was not found -- or with one refused goes by the kernel command line's
@@ -47,7 +52,7 @@ use crate::wire::{self, Ipv4 as Ip};
 /// from before it, which still needs the command line's words.
 pub const PATH: &str = "/etc/net.toml";
 
-/// The most the file may be: it has four keys.
+/// The most the file may be, comments and every interface's routes among it.
 pub const MAX_BYTES: usize = 4096;
 
 /// The longest parameter the C++ takes off the command line
@@ -59,7 +64,7 @@ const CMDLINE_MAX: usize = 256;
 
 const PREFIX_MAX: u32 = 32;
 
-/// The four keys, on the command line as in the file.
+/// The original keys, on the command line and in the file.
 const KEYS: [&str; 4] = ["ip", "gw", "dns", "dhcp"];
 
 /// When eth0 asks DHCP for its address.
@@ -91,6 +96,37 @@ pub enum Source {
     File,
 }
 
+pub const MAX_INTERFACES: usize = 16;
+pub const MAX_ROUTES: usize = 32;
+/// Also in the kernel image: nos-install checks it before allowing a
+/// multi-interface rollback to an older kernel.
+pub const FORMAT_MARKER: &str = "net.toml multi-NIC v2";
+
+/// An interface beside eth0. `others[0]` is eth1: eth0's fields stay where
+/// the command line's format and the original file put them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Interface {
+    pub address: Option<Address>,
+    pub dhcp: Dhcp,
+}
+
+impl Interface {
+    const NONE: Interface = Interface { address: None, dhcp: Dhcp::Command };
+
+    fn configured(&self) -> bool {
+        self.address.is_some() || self.dhcp == Dhcp::Boot
+    }
+}
+
+/// An additional route through `dev` (0 is eth0), longest prefix wins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Route {
+    pub dev: usize,
+    pub net: u32,
+    pub mask: u32,
+    pub gw: u32,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Settings {
     pub address: Option<Address>,
@@ -102,14 +138,33 @@ pub struct Settings {
     pub lease_dns: bool,
     pub dhcp: Dhcp,
     pub source: Source,
+    pub others: [Interface; MAX_INTERFACES - 1],
+    /// The interface of the default route, 0 for eth0.
+    pub default: usize,
+    pub routes: [Option<Route>; MAX_ROUTES],
+    pub route_count: usize,
 }
 
 impl Settings {
     /// A command line with none of the four: DHCP only when asked, by the
     /// command, and no resolver unless one is.
-    const NONE: Settings = Settings {
+    pub const NONE: Settings = Settings {
         address: None, dns: 0, lease_dns: false, dhcp: Dhcp::Command, source: Source::CommandLine,
+        others: [Interface::NONE; MAX_INTERFACES - 1], default: 0,
+        routes: [None; MAX_ROUTES], route_count: 0,
     };
+
+    pub fn interface(&self, index: usize) -> Interface {
+        if index == 0 {
+            Interface { address: self.address, dhcp: self.dhcp }
+        } else {
+            self.others.get(index - 1).copied().unwrap_or(Interface::NONE)
+        }
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.default != 0 || self.route_count != 0 || self.others.iter().any(Interface::configured)
+    }
 }
 
 /// What the settings come to, as the boot and `net` say it.
@@ -132,6 +187,23 @@ impl fmt::Display for Settings {
             f.write_str(", the lease's resolver")
         } else {
             Ok(())
+        }
+    }
+}
+
+impl fmt::Display for Interface {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.address, self.dhcp) {
+            (Some(a), _) => {
+                write!(f, "{}/{}", Ip(a.ip), a.mask.count_ones())?;
+                if a.gw != 0 {
+                    write!(f, ", gateway {}", Ip(a.gw))?;
+                }
+                Ok(())
+            }
+            (None, Dhcp::Boot) => f.write_str("DHCP"),
+            (None, Dhcp::Command) => f.write_str("no address until the dhcp command"),
+            (None, Dhcp::Off) => f.write_str("no address, DHCP off"),
         }
     }
 }
@@ -267,36 +339,138 @@ fn command_line(refuse: &mut dyn FnMut(&str, &str, &str)) -> Settings {
 
 /* ---- the file ---- */
 
-/// The file's keys as they are read; checked against each other once all
-/// of them are.
-#[derive(Default)]
-struct Reader {
-    ip: Option<(u32, u32)>,
-    /// The gateway, and its line.
+#[derive(Clone, Copy)]
+struct NicReader {
+    ip: Option<(u32, u32, usize)>,
     gw: Option<(u32, usize)>,
-    dns: Option<u32>,
-    /// `dhcp`, and its line.
     dhcp: Option<(bool, usize)>,
+}
+
+impl NicReader {
+    const NONE: NicReader = NicReader { ip: None, gw: None, dhcp: None };
+}
+
+struct Reader {
+    nics: [NicReader; MAX_INTERFACES],
+    dns: Option<u32>,
+    default: Option<(usize, usize)>,
+    routes: [Option<Route>; MAX_ROUTES],
+    route_lines: [usize; MAX_ROUTES],
+    route_count: usize,
+}
+
+impl Reader {
+    fn new() -> Reader {
+        Reader {
+            nics: [NicReader::NONE; MAX_INTERFACES], dns: None, default: None,
+            routes: [None; MAX_ROUTES], route_lines: [0; MAX_ROUTES], route_count: 0,
+        }
+    }
+}
+
+fn eth_number(text: &str) -> Option<usize> {
+    let n = text.strip_prefix("eth")?.parse::<usize>().ok()?;
+    (n < MAX_INTERFACES).then_some(n)
+}
+
+/// `ip_ethN`, `gw_ethN` or `dhcp_ethN`: the interface and the bare key.
+fn nic_key(key: &str) -> Option<(usize, &'static str)> {
+    for kind in ["ip", "gw", "dhcp"] {
+        let prefix = alloc::format!("{}_eth", kind);
+        if let Some(number) = key.strip_prefix(&prefix) {
+            let n = number.parse::<usize>().ok().filter(|n| *n < MAX_INTERFACES)?;
+            return Some((n, kind));
+        }
+    }
+    None
+}
+
+fn route_key(key: &str) -> Option<usize> {
+    key.strip_prefix("route_eth")?.parse::<usize>().ok().filter(|n| *n < MAX_INTERFACES)
+}
+
+/// A route's network, A.B.C.D/N with no host bits set.
+fn network(text: &str) -> Result<(u32, u32), &'static str> {
+    let (ip, prefix) = text.split_once('/').ok_or(NOT_ADDRESS_PREFIX)?;
+    let ip = wire::parse_ipv4(ip.as_bytes()).ok_or(NOT_ADDRESS_PREFIX)?;
+    if prefix.is_empty() || prefix.len() > 2 || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(NOT_ADDRESS_PREFIX);
+    }
+    let bits: u32 = prefix.parse().map_err(|_| NOT_ADDRESS_PREFIX)?;
+    if bits == 0 || bits > PREFIX_MAX {
+        return Err("has a prefix length that is not 1 to 32");
+    }
+    if !wire::host_address(ip, 0) {
+        return Err(NOT_HOST);
+    }
+    let mask = u32::MAX << (PREFIX_MAX - bits);
+    if ip & !mask != 0 {
+        return Err("has host bits set in its network address");
+    }
+    Ok((ip, mask))
+}
+
+fn route(text: &str, dev: usize) -> Result<Route, &'static str> {
+    let mut words = text.split_whitespace();
+    let (Some(net), Some(via), Some(gateway), None) = (words.next(), words.next(), words.next(), words.next()) else {
+        return Err("is not A.B.C.D/N via A.B.C.D");
+    };
+    if via != "via" {
+        return Err("is not A.B.C.D/N via A.B.C.D");
+    }
+    let (net, mask) = network(net)?;
+    let gw = host(gateway)?;
+    Ok(Route { dev, net, mask, gw })
 }
 
 impl conf::Keys for Reader {
     fn known(&mut self, line: usize, key: &str) -> Result<(), String> {
-        if KEYS.contains(&key) {
+        if KEYS.contains(&key) || key == "default" || nic_key(key).is_some() || route_key(key).is_some() {
             Ok(())
         } else {
-            Err(error(line, &alloc::format!("\"{}\" is not a key net.toml has: ip, gw, dns, dhcp", key)))
+            Err(error(line, &alloc::format!("\"{}\" is not a key net.toml has", key)))
         }
     }
 
     fn assign(&mut self, line: usize, key: &str, value: Value) -> Result<(), String> {
+        let (index, bare) = match key {
+            "ip" | "gw" | "dhcp" => (0, key),
+            _ => nic_key(key).map_or((0, key), |(n, bare)| (n, bare)),
+        };
+        if let Some(dev) = route_key(key) {
+            let Value::List(lines) = value else {
+                return Err(error(line, &alloc::format!("{} is a list of \"A.B.C.D/N via A.B.C.D\"", key)));
+            };
+            for text in lines {
+                let parsed = route(&text, dev).map_err(|why| error(line, &alloc::format!("{} \"{}\" {}", key, text, why)))?;
+                if self.route_count == MAX_ROUTES {
+                    return Err(error(line, &alloc::format!("{} takes the routes past {}", key, MAX_ROUTES)));
+                }
+                if self.routes[..self.route_count].iter().flatten().any(|r| r.dev == dev && r.net == parsed.net && r.mask == parsed.mask) {
+                    return Err(error(line, &alloc::format!("{} \"{}\" gives that network's route twice", key, text)));
+                }
+                self.routes[self.route_count] = Some(parsed);
+                self.route_lines[self.route_count] = line;
+                self.route_count += 1;
+            }
+            return Ok(());
+        }
+        if key == "default" {
+            let Value::Str(text) = value else {
+                return Err(error(line, "default is an interface name, \"eth0\""));
+            };
+            let n = eth_number(&text).ok_or_else(|| error(line, &alloc::format!("default \"{}\" is not an interface eth0 to eth{}", text, MAX_INTERFACES - 1)))?;
+            self.default = Some((n, line));
+            return Ok(());
+        }
         let text = match value {
-            Value::Bool(on) if key == "dhcp" => {
-                self.dhcp = Some((on, line));
+            Value::Bool(on) if bare == "dhcp" => {
+                self.nics[index].dhcp = Some((on, line));
                 return Ok(());
             }
-            Value::Str(text) if key != "dhcp" => text,
+            Value::Str(text) if bare != "dhcp" => text,
             other => {
-                let want = match key {
+                let want = match bare {
                     "dhcp" => "true or false",
                     "ip" => "a string, \"A.B.C.D/N\"",
                     _ => "a string, \"A.B.C.D\"",
@@ -305,9 +479,12 @@ impl conf::Keys for Reader {
             }
         };
         let wrong = |why: &str| error(line, &alloc::format!("{} \"{}\" {}", key, text, why));
-        match key {
-            "ip" => self.ip = Some(address(&text).map_err(wrong)?),
-            "gw" => self.gw = Some((host(&text).map_err(wrong)?, line)),
+        match bare {
+            "ip" => {
+                let (ip, mask) = address(&text).map_err(wrong)?;
+                self.nics[index].ip = Some((ip, mask, line));
+            }
+            "gw" => self.nics[index].gw = Some((host(&text).map_err(wrong)?, line)),
             _ => self.dns = Some(host(&text).map_err(wrong)?),
         }
         Ok(())
@@ -317,31 +494,76 @@ impl conf::Keys for Reader {
 /// The file's text read: the settings it gives, or what is wrong with it,
 /// its line said.
 pub fn from_file(text: &str) -> Result<Settings, String> {
-    let mut r = Reader::default();
+    let mut r = Reader::new();
     conf::parse(text, "net.toml", &mut r)?;
 
-    let address = match (r.ip, r.gw) {
-        (None, Some((_, line))) => {
-            return Err(error(line, "gw without an ip: a gateway is the way off ip's subnet"));
-        }
-        (None, None) => None,
-        (Some((ip, mask)), gw) => {
-            if let Some((true, line)) = r.dhcp {
-                return Err(error(line, "dhcp = true beside an ip: eth0's address is the one, or DHCP's"));
-            }
-            let mut a = Address { ip, mask, gw: 0 };
-            if let Some((g, line)) = gw {
-                gateway_of(g, ip, mask).map_err(|why| error(line, &alloc::format!("gw \"{}\" {}", Ip(g), why)))?;
-                a.gw = g;
-            }
-            Some(a)
-        }
+    let mut s = Settings {
+        dns: r.dns.unwrap_or(0), lease_dns: true, dhcp: Dhcp::Boot, source: Source::File, ..Settings::NONE
     };
-    let dhcp = match (address, r.dhcp) {
-        (Some(_), _) | (None, Some((false, _))) => Dhcp::Command,
-        (None, _) => Dhcp::Boot,
-    };
-    Ok(Settings { address, dns: r.dns.unwrap_or(0), lease_dns: true, dhcp, source: Source::File })
+    for index in 0..MAX_INTERFACES {
+        let given = r.nics[index];
+        let address = match (given.ip, given.gw) {
+            (None, Some((_, line))) => {
+                return Err(error(line, "gw without an ip: a gateway is the way off ip's subnet"));
+            }
+            (None, None) => None,
+            (Some((ip, mask, _)), gw) => {
+                if let Some((true, line)) = given.dhcp {
+                    return Err(error(line, &alloc::format!("dhcp = true beside an ip: eth{}'s address is the one, or DHCP's", index)));
+                }
+                let mut a = Address { ip, mask, gw: 0 };
+                if let Some((g, line)) = gw {
+                    gateway_of(g, ip, mask).map_err(|why| error(line, &alloc::format!("gw \"{}\" {}", Ip(g), why)))?;
+                    a.gw = g;
+                }
+                Some(a)
+            }
+        };
+        let dhcp = match (address, given.dhcp, index) {
+            (Some(_), _, _) | (None, Some((false, _)), _) => Dhcp::Command,
+            (None, None, 0) | (None, Some((true, _)), _) => Dhcp::Boot,
+            (None, None, _) => Dhcp::Command,
+        };
+        if index == 0 {
+            s.address = address;
+            s.dhcp = dhcp;
+        } else {
+            s.others[index - 1] = Interface { address, dhcp };
+        }
+    }
+
+    if let Some((n, line)) = r.default {
+        let i = s.interface(n);
+        if i.address.is_none() && i.dhcp != Dhcp::Boot {
+            return Err(error(line, &alloc::format!("default = \"eth{}\", which has no address or DHCP", n)));
+        }
+        if i.address.is_some_and(|a| a.gw == 0) {
+            return Err(error(line, &alloc::format!("default = \"eth{}\", whose static address has no gateway", n)));
+        }
+        s.default = n;
+    }
+    for (index, a) in (0..MAX_INTERFACES).filter_map(|n| s.interface(n).address.map(|a| (n, a))) {
+        for (other, b) in (index + 1..MAX_INTERFACES).filter_map(|n| s.interface(n).address.map(|a| (n, a))) {
+            if a.ip & b.mask == b.ip & b.mask || b.ip & a.mask == a.ip & a.mask {
+                let line = r.nics[other].ip.map_or(1, |(_, _, line)| line);
+                return Err(error(line, &alloc::format!("eth{} and eth{} have overlapping subnets", index, other)));
+            }
+        }
+    }
+    for (at, route) in r.routes[..r.route_count].iter().enumerate().filter_map(|(at, r)| r.map(|r| (at, r))) {
+        let line = r.route_lines[at];
+        let i = s.interface(route.dev);
+        if i.address.is_none() && i.dhcp != Dhcp::Boot {
+            return Err(error(line, &alloc::format!("a route through eth{}, which has no address or DHCP", route.dev)));
+        }
+        if let Some(a) = i.address {
+            gateway_of(route.gw, a.ip, a.mask)
+                .map_err(|why| error(line, &alloc::format!("route gateway {} on eth{} {}", Ip(route.gw), route.dev, why)))?;
+        }
+    }
+    s.routes = r.routes;
+    s.route_count = r.route_count;
+    Ok(s)
 }
 
 /// What the root holds at `PATH`.
@@ -397,13 +619,38 @@ static DECIDED: OnceBox<Settings> = OnceBox::new();
 /// `net` to say.
 static REFUSED: OnceBox<String> = OnceBox::new();
 
-/// eth0's settings: what the boot decided -- or, before it has, and where
-/// nothing boots (a fuzzer), the command line's.
+/// Every interface's settings: what the boot decided -- or, before it has,
+/// and where nothing boots (a fuzzer), the command line's.
 pub fn current() -> Settings {
     match DECIDED.get() {
         Some(settings) => *settings,
         None => command_line(&mut |_, _, _| {}),
     }
+}
+
+pub fn default_index() -> usize {
+    DECIDED.get().map_or(0, |s| s.default)
+}
+
+pub fn is_multi() -> bool {
+    DECIDED.get().is_some_and(|s| s.is_multi())
+}
+
+/// The most specific additional route to `dst`.
+pub fn route_for(dst: u32) -> Option<Route> {
+    let s = DECIDED.get()?;
+    s.routes[..s.route_count].iter().flatten()
+        .filter(|r| r.mask != 0 && dst & r.mask == r.net)
+        .max_by_key(|r| r.mask.count_ones()).copied()
+}
+
+/// The most specific additional route to `dst` through one interface. A
+/// caller pinned to another interface never takes it.
+pub fn route_for_dev(index: usize, dst: u32) -> Option<Route> {
+    let s = DECIDED.get()?;
+    s.routes[..s.route_count].iter().flatten()
+        .filter(|r| r.dev == index && r.mask != 0 && dst & r.mask == r.net)
+        .max_by_key(|r| r.mask.count_ones()).copied()
 }
 
 /// Why the root's `PATH` was not taken, if it was there.
@@ -417,9 +664,9 @@ fn say_refused(key: &str, value: &str, why: &str) {
 }
 
 /// Boot, once the root filesystem is mounted and before the shell, the
-/// netconsole or the shell over UDP start: eth0's settings, from the root's
-/// `PATH` or else the command line, decided for the rest of the boot and
-/// said. Called once, by each architecture's boot.
+/// netconsole or the shell over UDP start: every interface's settings, from
+/// the root's `PATH` or else the command line, decided for the rest of the
+/// boot and said. Called once, by each architecture's boot.
 #[no_mangle]
 pub extern "C" fn rust_net_settings_from_root() {
     let found = match fs::vfs_instance() {
@@ -435,6 +682,9 @@ pub extern "C" fn rust_net_settings_from_root() {
     let settings = match parsed {
         Some(Ok(settings)) => {
             klog!(0, "net: eth0's settings from {}: {}", PATH, settings);
+            if settings.is_multi() {
+                klog!(0, "net: {}: {}", PATH, FORMAT_MARKER);
+            }
             /* The command line's words are not used: said, since the system
              * image's GRUB entries pass dhcp=auto dns=on to every boot, for
              * a root with no file and for a kernel from before it */
@@ -503,6 +753,7 @@ pub fn selftest() -> bool {
     ok &= check("a static address off the command line", n == 0 && fixed == Settings {
         address: Some(Address { ip: 0xD5E8_E188, mask: 0xFFFF_FF00, gw: 0xD5E8_E101 }),
         dns: 0xD594_00DD, lease_dns: true, dhcp: Dhcp::Boot, source: Source::CommandLine,
+        ..Settings::NONE
     });
     /* /31 and /32 have no network or broadcast address of their own */
     let (host_route, n) = line("ip=10.0.0.0/31");
@@ -511,6 +762,8 @@ pub fn selftest() -> bool {
     ok &= check("dhcp=off, dns=on", n == 0 && plain.dhcp == Dhcp::Off && plain.lease_dns && plain.address.is_none());
     let (nothing, n) = line("ip= gw dhcp root=auto");
     ok &= check("none of them, and words that are not one", n == 0 && nothing == Settings::NONE);
+    ok &= check("an unmentioned NIC still allows the dhcp command",
+        nothing.interface(1).dhcp == Dhcp::Command && !nothing.is_multi());
 
     /* Refused, and nothing of them kept: no prefix, a prefix out of range,
      * the subnet's own network and broadcast addresses, addresses no host
@@ -532,11 +785,26 @@ pub fn selftest() -> bool {
     ok &= check("a file's static address", file == Ok(Settings {
         address: Some(Address { ip: 0xCB00_7105, mask: 0xFFFF_FF00, gw: 0xCB00_7101 }),
         dns: 0xCB00_7135, lease_dns: true, dhcp: Dhcp::Command, source: Source::File,
+        ..Settings::NONE
     }));
     for dhcp in ["dhcp = true\n", "", "# nothing said\n"] {
         ok &= check(dhcp, from_file(dhcp).map(|s| (s.dhcp, s.address, s.lease_dns)) == Ok((Dhcp::Boot, None, true)));
     }
     ok &= check("dhcp = false", from_file("dhcp = false").map(|s| (s.dhcp, s.address)) == Ok((Dhcp::Command, None)));
+
+    let mut multi = Settings {
+        address: None, dns: 0x4D58_0808, lease_dns: true, dhcp: Dhcp::Boot, source: Source::File,
+        ..Settings::NONE
+    };
+    multi.others[0] = Interface {
+        address: Some(Address { ip: 0x5E7E_CDED, mask: 0xFFFF_FFFE, gw: 0x5E7E_CDEC }), dhcp: Dhcp::Command,
+    };
+    multi.default = 1;
+    multi.routes[0] = Some(Route { dev: 0, net: 0x0A00_0000, mask: 0xFF00_0000, gw: 0x0A00_0001 });
+    multi.route_count = 1;
+    ok &= check("DHCP inside, a static /31 outside and a private route",
+        from_file("dhcp_eth0 = true\nip_eth1 = \"94.126.205.237/31\"\ngw_eth1 = \"94.126.205.236\"\n\
+                   default = \"eth1\"\ndns = \"77.88.8.8\"\nroute_eth0 = [\"10.0.0.0/8 via 10.0.0.1\"]\n") == Ok(multi));
 
     /* Refused whole, with the line of what is wrong */
     for (bad, at) in [
@@ -551,8 +819,17 @@ pub fn selftest() -> bool {
         ("ip = \"10.0.0.5/24\"\nip = \"10.0.0.6/24\"", "line 2:"),
         ("dns = \"255.255.255.255\"", "line 1:"),
         ("[eth0]", "line 1:"),
+        ("default = \"eth1\"", "line 1:"),
+        ("ip_eth1 = \"203.0.113.5/24\"\ndefault = \"eth1\"", "line 2:"),
     ] {
         ok &= check(bad, matches!(from_file(bad), Err(why) if why.starts_with(at)));
+    }
+    for bad in [
+        "ip = \"10.0.0.2/24\"\nip_eth1 = \"10.0.0.3/24\"",
+        "ip = \"10.0.0.2/24\"\nroute_eth0 = [\"192.168.0.0/16 via 10.0.1.1\"]",
+        "dhcp_eth0 = true\nroute_eth0 = [\"10.0.0.0/8\", \"10.0.0.0/8 via 10.0.0.1 via 10.0.0.2\"]",
+    ] {
+        ok &= check(bad, from_file(bad).is_err());
     }
     ok
 }

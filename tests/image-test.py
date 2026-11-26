@@ -47,7 +47,9 @@ entry), from its own grub.cfg, with the command line kept in its grubenv,
 and nos sees the blank partition by its GUID. Status and update find that
 root by themselves and leave every GRUB of the machine alone; boot has
 nothing to arm, uninstall nothing to take out, and an install over it is
-refused.
+refused. A further boot gives nos two NICs: DHCP on eth0 inside, a static
+address, the default route and sshd on eth1 outside, and an additional
+private route through eth0.
 
 The Linux side (losetup, mkfs, mount, nos-install) runs under sudo on Linux,
 and in the nos-builder image, --privileged, elsewhere; QEMU runs here.
@@ -581,6 +583,18 @@ for bad in '--cmdline ip=10.0.2.15/24' '--ip 10.0.2.0/24' '--ip 10.0.2.15/24 --g
     fi
 done
 debugfs -R 'cat /etc/net.toml' "${WHOLE}p3" 2>/dev/null > disk-nettoml4.out
+# Two NICs under QEMU next: DHCP inside, a static address and sshd outside.
+mount_at "${WHOLE}p3" root
+cat > root/etc/net.toml <<'EOF'
+dhcp_eth0 = true
+ip_eth1 = "198.51.100.5/24"
+gw_eth1 = "198.51.100.2"
+dns = "198.51.100.3"
+default = "eth1"
+route_eth0 = ["10.0.0.0/8 via 10.0.2.2"]
+EOF
+sed -i -E 's/^sshd start( 22 nic=eth[0-9]+)?$/sshd start 22 nic=eth1/' root/etc/rc
+unmount_last
 if disk_install uninstall > disk-uninstall.out 2>&1; then
     echo "uninstall: done"
 fi
@@ -591,7 +605,7 @@ fi
 cat disk-install.out
 echo "grub.d: $(ls -A grub.d.disk | wc -l)"
 mount_at "${WHOLE}p3" root ro
-same_as_image root disk-update
+same_as_image root disk-update etc/rc
 unmount_last
 e2fsck -fn "${WHOLE}p3" > fsck6.out 2>&1 && echo "fsck6: clean" || { cat fsck6.out; echo "fsck6: DAMAGED"; }
 """
@@ -650,9 +664,9 @@ class Machine:
         self.qemu = None
         self.log = None
 
-    def boot(self, name, disk="disk.raw", firmware=None):
+    def boot(self, name, disk="disk.raw", firmware=None, two_nics=False):
         """`firmware`: UEFI's code and variables, for the two flash chips --
-        SeaBIOS without it."""
+        SeaBIOS without it. `two_nics`: DHCP inside, a static network outside."""
         self.log = os.path.join(self.tmp, "serial-%s.log" % name)
         argv = ["qemu-system-x86_64", "-display", "none", "-no-reboot", "-m", "1G", "-smp", "2"]
         if firmware is not None:
@@ -662,11 +676,19 @@ class Machine:
             argv += ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % code,
                      "-drive", "if=pflash,format=raw,unit=1,file=%s" % mine]
         argv += ["-drive", "file=%s,format=raw,if=none,id=d0" % os.path.join(self.tmp, disk),
-                "-device", "virtio-blk-pci,drive=d0,bootindex=0,disable-legacy=on,disable-modern=off",
-                "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=udp:127.0.0.1:%d-:%d"
-                % (self.ssh_port, self.udp_port, SHELL_PORT),
-                "-device", "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off",
-                "-device", "virtio-rng-pci", "-serial", "file:" + self.log]
+                "-device", "virtio-blk-pci,drive=d0,bootindex=0,disable-legacy=on,disable-modern=off"]
+        if two_nics:
+            argv += ["-netdev", "user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15",
+                     "-device", "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off",
+                     "-netdev", "user,id=n1,net=198.51.100.0/24,host=198.51.100.2,dns=198.51.100.3,"
+                     "dhcpstart=198.51.100.5,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=udp:127.0.0.1:%d-:%d"
+                     % (self.ssh_port, self.udp_port, SHELL_PORT),
+                     "-device", "virtio-net-pci,netdev=n1,disable-legacy=on,disable-modern=off"]
+        else:
+            argv += ["-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=udp:127.0.0.1:%d-:%d"
+                     % (self.ssh_port, self.udp_port, SHELL_PORT),
+                     "-device", "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off"]
+        argv += ["-device", "virtio-rng-pci", "-serial", "file:" + self.log]
         if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.W_OK):
             argv += ["-enable-kvm", "-cpu", "host"]
         else:
@@ -1021,6 +1043,27 @@ def run_disk(tmp, linux, key, want):
           "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
           linux.read("disk-install.out"))
     check("e2fsck finds the root clean after the update", "fsck6: clean" in out, out)
+
+    m.boot("disk-two-nics", disk="whole.raw", two_nics=True)
+    try:
+        check("two NICs boot nos", m.wait_log("boot: complete", BOOT_TIMEOUT), m.text()[-3000:])
+        version = m.wait_ssh(300)
+        check("sshd answers through the second NIC", version == want,
+              "%r, the image's VERSION says %r" % (version, want))
+        if version is not None:
+            rc, out = m.ssh(["net"])
+            check("DHCP inside, a static default route and a private route outside",
+                  rc == 0 and "eth0 settings: DHCP" in out and
+                  "eth1 settings: 198.51.100.5/24, gateway 198.51.100.2" in out and
+                  "default route: eth1" in out and "route 10.0.0.0/8 via 10.0.2.2 dev eth0" in out, out)
+            rc, out = m.ssh(["ping", "10.0.2.2"])
+            check("the inside DHCP network answers through eth0", rc == 0 and "5/5 received" in out, out)
+            rc, out = m.ssh(["cat", "/etc/rc"])
+            check("the installed sshd listens on the default interface", rc == 0 and "sshd start 22 nic=eth1" in out, out)
+        m.ssh(["poweroff"], timeout=60)
+        check("nos powers off with two NICs", m.wait_exit(120))
+    finally:
+        m.stop()
 
 
 def nettoml_values(text):
