@@ -24,8 +24,10 @@ VERSION, /etc and the host key kept, and the kernel parameters it is given
 for the management panel printed once, its scrypt hash alone on the
 partition, as the panel checks it, and /etc/rc given the panel's lines --
 whose api.ko then serves at the next boot, and whose `api panel create`
-makes no panel of an image released without one, and says so. Then status,
-rollback and uninstall.
+makes no panel of an image released without one, and says so. --nbs prepares
+this host's /etc/ipc/hosts.toml and the ipcnet/cluster/NBS boot lines; the next
+boot has both providers but no initialized cluster, and updates, --no-nbs and
+re-enabling keep the identity intact. Then status, rollback and uninstall.
 
 The disk: an MBR with a "host" partition holding GRUB as a server's /boot
 would -- its default entry stands in for the machine's own OS and says so on
@@ -62,6 +64,7 @@ Build the image first: make image, or scripts/build-image.sh.
 import argparse
 import base64
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -257,11 +260,12 @@ printf 'a kernel from before the settings file\n' > part/boot/kernel64.elf
 unmount_last
 
 # no partition named: the GRUB entry names it
-nos_install update --udpshell --boot-once --panel > update.out 2>&1 || { cat update.out; exit 1; }
+nos_install update --udpshell --boot-once --panel --nbs --nbs-host image-test > update.out 2>&1 || { cat update.out; exit 1; }
 cat update.out
 
 mount_at "$NOS" part ro
 cp part/etc/rc rc2.out
+cat part/etc/ipc/hosts.toml > ipchosts2.out
 cat part/etc/api/panel.pass > panelpass2.out 2>/dev/null || echo none > panelpass2.out
 grub-editenv part/grubenv list > grubenv2.out
 cat part/etc/net.toml > nettoml2.out 2>/dev/null || echo none > nettoml2.out
@@ -284,6 +288,18 @@ nos_install update > update3.out 2>&1 || { cat update3.out; exit 1; }
 cat update3.out
 mount_at "$NOS" part ro
 grub-editenv part/grubenv list > grubenv3.out
+cat part/etc/ipc/hosts.toml > ipchosts3.out
+cp part/etc/rc rc3.out
+unmount_last
+nos_install update --no-nbs > update4.out 2>&1 || { cat update4.out; exit 1; }
+mount_at "$NOS" part ro
+cat part/etc/ipc/hosts.toml > ipchosts4.out
+cp part/etc/rc rc4.out
+unmount_last
+nos_install update --nbs --nbs-host another-name > update5.out 2>&1 || { cat update5.out; exit 1; }
+mount_at "$NOS" part ro
+cat part/etc/ipc/hosts.toml > ipchosts5.out
+cp part/etc/rc rc5.out
 unmount_last
 nos_install rollback > rollback.out 2>&1 || { cat rollback.out; exit 1; }
 cat rollback.out
@@ -595,6 +611,9 @@ route_eth0 = ["10.0.0.0/8 via 10.0.2.2"]
 EOF
 sed -i -E 's/^sshd start( 22 nic=eth[0-9]+)?$/sshd start 22 nic=eth1/' root/etc/rc
 unmount_last
+# With no network option, NBS takes the default interface the root already has.
+disk_install update --nbs --nbs-host disk-test > disk-nbs.out 2>&1 || { cat disk-nbs.out; exit 1; }
+debugfs -R 'cat /etc/ipc/hosts.toml' "${WHOLE}p3" 2>/dev/null > disk-ipchosts.out
 if disk_install uninstall > disk-uninstall.out 2>&1; then
     echo "uninstall: done"
 fi
@@ -806,6 +825,8 @@ def expected_version(text):
 
 # The management panel's lines nos-install --panel gives /etc/rc, in order
 PANEL_RC = ["insmod /lib/modules/hv.ko", "hv on", "insmod /lib/modules/api.ko", "api start", "api panel create"]
+NBS_RC = ["insmod /lib/modules/ipcnet.ko", "ipcnet start", "insmod /lib/modules/cluster.ko",
+          "insmod /lib/modules/nbs-mds.ko", "insmod /lib/modules/nbs-cs.ko"]
 
 
 def scrypt_matches(password, line):
@@ -1038,6 +1059,9 @@ def run_disk(tmp, linux, key, want):
     check("nos-install refuses what the kernel would refuse of a network, and ip= in --cmdline, before writing",
           len(refused) == 8 and not any(line.startswith("network refused: no,") for line in refused) and
           linux.read("disk-nettoml4.out") == nettoml3, refused)
+    check("NBS takes the existing multi-interface configuration's default NIC",
+          'name = "disk-test"' in linux.read("disk-ipchosts.out") and
+          'nic = "eth1"' in linux.read("disk-ipchosts.out"), linux.read("disk-ipchosts.out"))
     check("uninstall has nothing to take out", "uninstall: done" not in out, linux.read("disk-uninstall.out"))
     check("an install over its root is refused: update is what renews it",
           "install over it: done" not in out and "nos-install update" in linux.read("disk-install.out"),
@@ -1060,6 +1084,13 @@ def run_disk(tmp, linux, key, want):
             check("the inside DHCP network answers through eth0", rc == 0 and "5/5 received" in out, out)
             rc, out = m.ssh(["cat", "/etc/rc"])
             check("the installed sshd listens on the default interface", rc == 0 and "sshd start 22 nic=eth1" in out, out)
+            for _ in range(API_WAIT):
+                rc, out = m.ssh(["ipcnet"])
+                if rc == 0 and "disk-test in cluster " in out:
+                    break
+                time.sleep(1)
+            check("NBS's ipcnet listens on that interface too",
+                  rc == 0 and "disk-test in cluster " in out and "on eth1 port 39240" in out, out)
         m.ssh(["poweroff"], timeout=60)
         check("nos powers off with two NICs", m.wait_exit(120))
     finally:
@@ -1213,6 +1244,15 @@ def run(tmp, image):
     check("and gives /etc/rc the panel's lines, in order, after the image's own",
           in_order(rc2, PANEL_RC) and "insmod /lib/modules/sshd.ko" in rc2 and
           rc2.index("insmod /lib/modules/sshd.ko") < rc2.index("api panel create"), rc2)
+    check("update --nbs adds every module before the panel starts, but neither creates a cluster nor adds a device",
+          in_order(rc2, NBS_RC) and rc2.index(NBS_RC[0]) < rc2.index(PANEL_RC[0]) and
+          not any(cmd in line for line in rc2 for cmd in
+                  ("cluster init ", "cluster join ", "nbs init ", "nbs host add ", "nbs devices add ")), rc2)
+    hosts2 = linux.read("ipchosts2.out")
+    check("and prepares this host's name, a fresh cluster id and its default NIC in /etc/ipc/hosts.toml",
+          'name = "image-test"' in hosts2 and 'nic = "eth0"' in hosts2 and "peers = []" in hosts2 and
+          any(len(line) == len('cluster = ""') + 32 and line.startswith('cluster = "') and line.endswith('"') and
+              all(c in "0123456789abcdef" for c in line[11:-1]) for line in hosts2.splitlines()), hosts2)
     has_bundle = linux.read("img-bundle.out").startswith("url=")
 
     # Boot 3: the update, with the UDP shell asked for
@@ -1236,6 +1276,25 @@ def run(tmp, image):
                 break
             time.sleep(1)
         check("/etc/rc's api.ko serves the host API", rc == 0 and "api: serving port 39234" in out, out)
+        rc, out = m.ssh(["ipcnet"])
+        check("/etc/rc's ipcnet serves this host on its configured NIC",
+              rc == 0 and "image-test in cluster " in out and "on eth0 port 39240" in out, out)
+        rc, cluster_out = m.ssh(["mgmt", "call", "cluster", "status"])
+        try:
+            cluster_status = json.loads(cluster_out) if rc == 0 else None
+        except json.JSONDecodeError:
+            cluster_status = None
+        check("the cluster provider is in the panel's catalog before any init, with this host ready to invite or join",
+              cluster_status is not None and cluster_status.get("member") is False and
+              (cluster_status.get("this_host") or {}).get("name") == "image-test" and
+              cluster_status["this_host"].get("serving") is True, cluster_out)
+        rc, nbs_out = m.ssh(["mgmt", "call", "nbs", "status"])
+        try:
+            nbs_status = json.loads(nbs_out) if rc == 0 else None
+        except json.JSONDecodeError:
+            nbs_status = None
+        check("the NBS provider is there too, with no cluster made by the installer",
+              nbs_status == {"member": False, "stopped": None}, nbs_out)
         rc, out = m.ssh(["dmesg"])
         if has_bundle:
             print("  (the image has /lib/panel/bundle: its api panel create downloads, which this test does not)")
@@ -1261,6 +1320,17 @@ def run(tmp, image):
           "nos_cmdline=udpshell=9000" in env3.splitlines() and
           "the kernel parameters' ip=, gw=, dns= and dhcp= taken out" in linux.read("update3.out"),
           env3 + linux.read("update3.out")[-600:])
+    rc3 = [line.strip() for line in linux.read("rc3.out").splitlines()]
+    check("an update without --nbs keeps its boot lines and identity unchanged",
+          in_order(rc3, NBS_RC) and linux.read("ipchosts3.out") == hosts2, linux.read("rc3.out"))
+    rc4 = [line.strip() for line in linux.read("rc4.out").splitlines()]
+    check("--no-nbs takes only NBS's boot lines out and keeps its state and the panel",
+          not any(line in rc4 for line in NBS_RC) and in_order(rc4, PANEL_RC) and
+          linux.read("ipchosts4.out") == hosts2, linux.read("rc4.out"))
+    rc5 = [line.strip() for line in linux.read("rc5.out").splitlines()]
+    check("enabling NBS again restores each line once and never replaces the host's identity",
+          all(rc5.count(line) == 1 for line in NBS_RC) and linux.read("ipchosts5.out") == hosts2,
+          linux.read("rc5.out") + linux.read("ipchosts5.out"))
     check("uninstall takes the GRUB entry away", "uninstalled: yes" in out, out)
 
     run_disk(tmp, linux, key, want)

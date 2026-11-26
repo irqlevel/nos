@@ -166,6 +166,8 @@ The server's default boot entry does not change.
 | `--dhcp` | nos's address by DHCP, at every boot: what `/etc/net.toml` says when no option of the network is given |
 | `--network-here` | the address, gateway and DNS server this Linux has (below) |
 | `--panel` | the management panel (below); `--no-panel` takes `api panel create` out of `/etc/rc` again |
+| `--nbs` | NBS prepared at every boot (below); `--no-nbs` takes its lines out of `/etc/rc`, keeping `/etc/ipc` and NBS's state |
+| `--nbs-host NAME` | this host's unique name in the cluster, with `--nbs`: lowercase letters, digits and `-`, up to 63 characters; without it, this Linux's hostname, sanitized |
 | `--format` | a new filesystem on the partition, even over one there |
 | `--boot-once`, `--reboot` | boot nos once, the next time -- and reboot now |
 | `--image FILE` | the image, when this `nos-install` is not the one inside it |
@@ -197,6 +199,44 @@ later, its certificate the one `api panel` prints the fingerprint of. An
 update with `--panel` keeps the password there is. `python3` is needed for
 the hash (`hashlib.scrypt`): the ISO carries it, and the one-line installer
 installs it with the other missing packages where apt-get or pacman is available.
+
+### NBS alongside the panel
+
+After **Install the management panel?** is answered **Yes**, the interactive
+installer asks **Enable NBS (replicated block storage)?**, again with **No**
+the default. **Yes** also asks this host's unique name in the cluster. An ISO
+built with answers takes `nbs=yes` (only with `panel=yes`) and `nbs_host=node1`;
+without the latter, the Linux hostname, made lowercase and stripped of
+characters a host's name cannot have, is used. The direct equivalent is
+`--nbs [--nbs-host NAME]`, on `install`, `disk` and `update`.
+
+Install every host alike. The option writes `/etc/ipc/hosts.toml` once, with
+the host's name, a fresh random cluster id and the default route's `ethN` from
+`/etc/net.toml`; a later `cluster join` replaces that id and adds the peers. An
+update never replaces the file. The interface can be changed there before a
+host joins, for example to a private network's NIC. `/etc/rc` is given:
+
+```
+insmod /lib/modules/ipcnet.ko
+ipcnet start
+insmod /lib/modules/cluster.ko
+insmod /lib/modules/nbs-mds.ko
+insmod /lib/modules/nbs-cs.ko
+```
+
+The installer **creates no cluster and adds no storage device**. At the first
+boot the panel already has **Cluster** and **Block storage** pages, but this
+host is not a member yet. In the panel:
+
+1. On the first host, **Cluster → Init**. Invite each other host, and answer
+   **Join** on that host ([The cluster's registry](cluster.md#using-it)).
+2. On the first host, **Block storage → Init**, then **Add host** for every
+   other member.
+3. On each host, **Block storage → Add device** for its `nos-data` partition.
+   Adding a device formats it as NBS's; the installer never does this itself.
+
+NBS places every chunk on **three different hosts**: a prepared one- or
+two-host cluster cannot create volumes yet. See [NBS](nbs.md#using-it).
 
 ## Booting nos
 
@@ -418,7 +458,7 @@ The dialog asks which disk -- every one Linux sees, each said with its
 model, serial and size, what it holds and whether nos can read it -- how big
 nos's root is to be, the network, the keys sshd is to let in (pasted, or
 fetched by URL or as a GitHub user's `https://github.com/<user>.keys`, their
-fingerprints shown), and whether to install the management panel. Then what
+fingerprints shown), whether to install the management panel and, with it, whether to enable NBS. Then what
 `nos-install disk --dry-run` would write, and the disk's name typed to erase
 it. When it is done: take the ISO out of the virtual media and reboot --
 under UEFI the firmware is told to boot the
@@ -455,7 +495,7 @@ scripts/installer/build.sh --answers answers    # one that asks nothing
 An ISO built with answers ([`answers.example`](../scripts/installer/answers.example))
 installs with no questions, as a fleet's is: the disk by its
 `/dev/disk/by-id` name, `wipe=yes`, the root's size, the keys or their URLs,
-a static address, netconsole, kernel parameters, `panel=yes` where wanted,
+a static address, netconsole, kernel parameters, `panel=yes` and `nbs=yes` with a unique `nbs_host` where wanted,
 and what to do after --
 `poweroff` unless told, `reboot` (the virtual CD ejected first where the BMC
 lets it be), or stay. What it does goes to the screen and, at the level
@@ -614,6 +654,7 @@ On the partition, which is nos's root:
 | `/etc/ssh/authorized_keys` | `--ssh-key` | the keys sshd lets in (`sshd allow` adds one from inside) |
 | `/etc/ssh/ssh_host_ed25519_key` | sshd, at its first start | nos's host key |
 | `/etc/api/` | `--panel`, and the host API at its first start | `panel.pass`, root's password's hash for the panel; the host API's key, its clients, api.toml ([The host API](api.md#the-folder)) |
+| `/etc/ipc/` | `--nbs`, and ipcnet at its first start | `hosts.toml`: this host's name, cluster id and interface, then its peers; its key and certificate ([ipcnet](ipc.md#between-hosts)) |
 
 On the server's Linux there is one file, `/etc/grub.d/42_nos`, which holds
 the partition's UUID and nothing else of the machine's. It is run by

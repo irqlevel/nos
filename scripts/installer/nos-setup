@@ -1,8 +1,8 @@
 #!/bin/bash
 # nos-setup: the nos installer's dialog (scripts/installer, docs/install.md,
 # "From an ISO", "From a provider's rescue system"). It asks which disk, how
-# big nos's root, what network, which keys and whether to install the panel,
-# shows what will be written and has the disk's name typed to go on -- then
+# big nos's root, what network, which keys and whether to install the panel
+# and prepare NBS, shows what will be written and has the disk's name typed to go on -- then
 # hands it all to the system image's nos-install disk, which checks everything
 # again and writes.
 #
@@ -70,7 +70,7 @@ add_answer() {
     case "$k" in
         key) KEYS+=("$v") ;;
         key_url) KEY_URLS+=("$v") ;;
-        disk|wipe|root_size|ip|gw|dns|netconsole|cmdline|panel|after) ANS[$k]=$v ;;
+        disk|wipe|root_size|ip|gw|dns|netconsole|cmdline|panel|nbs|nbs_host|after) ANS[$k]=$v ;;
         *) say "answers: there is no answer called $k -- left out" ;;
     esac
 }
@@ -470,7 +470,7 @@ eject_media() {
 
 # nos-install disk with what was answered or chosen: DISK, ROOT_SIZE,
 # WIPE, the network (NOS_NET: /etc/net.toml's), NETCONSOLE, NOS_CMDLINE,
-# PANEL and the keys -- its lines on the screen and in the kernel log. $1
+# PANEL, NBS, NBS_HOST and the keys -- its lines on the screen and in the kernel log. $1
 # "--dry-run" only says what it would write
 run_install() {
     local args=(disk "$DISK" --root-size "$ROOT_SIZE") line
@@ -480,6 +480,9 @@ run_install() {
     [ -z "$NETCONSOLE" ] || args+=(--netconsole "$NETCONSOLE")
     [ -z "$NOS_CMDLINE" ] || args+=(--cmdline "$NOS_CMDLINE")
     [ "$PANEL" = 0 ] || args+=(--panel)
+    if [ "$NBS" = 1 ]; then
+        args+=(--nbs --nbs-host "$NBS_HOST")
+    fi
     [ -z "${1:-}" ] || args+=("$1")
     say "nos-install ${args[*]}"
     nos_install "${args[@]}" 2>&1 | while IFS= read -r line; do
@@ -500,6 +503,17 @@ NOS_NET=(--dhcp)
 NOS_CMDLINE=
 NETCONSOLE=
 PANEL=0
+NBS=0
+NBS_HOST=
+
+nbs_host_default() {
+    local name
+    name=$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9-]+/-/g' | cut -c1-63)
+    name=${name#-}
+    name=${name%-}
+    [ -n "$name" ] || name=node
+    printf '%s\n' "$name"
+}
 
 # nos's network a static address: IP, GW, DNS
 net_static_chosen() {
@@ -547,6 +561,20 @@ unattended() {
     NETCONSOLE=${ANS[netconsole]:-}
     NOS_CMDLINE=${ANS[cmdline]:-}
     [ "${ANS[panel]:-no}" != yes ] || PANEL=1
+    if [ "${ANS[nbs]:-no}" = yes ]; then
+        if [ "$PANEL" = 0 ]; then
+            say "FAILED: nbs=yes needs panel=yes -- NBS is prepared for the panel here"
+            return 1
+        fi
+        NBS=1
+    fi
+    if [ -n "${ANS[nbs_host]:-}" ] && [ "$NBS" = 0 ]; then
+        say "FAILED: nbs_host goes with nbs=yes and panel=yes"
+        return 1
+    fi
+    if [ "$NBS" = 1 ]; then
+        NBS_HOST=${ANS[nbs_host]:-$(nbs_host_default)}
+    fi
     wait_carrier || say "network: no card has a link"
     if [ -n "${ANS[ip]:-}" ]; then
         if ! valid_cidr "${ANS[ip]}" || ! valid_ip "${ANS[gw]:-}" || ! valid_ip "${ANS[dns]:-}"; then
@@ -873,11 +901,31 @@ ask_keys() {
 }
 
 ask_panel() {
+    NBS=0
+    NBS_HOST=
     if whiptail --title "$TITLE" --defaultno --yesno "Install the management panel?\n\nAt nos's first boot, a VM is created from Debian's cloud image and the panel's bundle, both downloaded. The panel then manages nos in a browser at https://<server>:39233.\n\nThe installer prints root's panel password once." 16 76; then
         PANEL=1
     else
         PANEL=0
     fi
+}
+
+ask_nbs() {
+    local v
+    [ "$PANEL" = 1 ] || return 0
+    if ! whiptail --title "$TITLE" --defaultno --yesno "Enable NBS (replicated block storage)?\n\nThe cluster and NBS modules will start at every boot. This does not create a cluster, format nos-data or add a device: after installing every host alike, do Cluster init/invite/join and Block storage init/add host/add device in the panel. Volumes take three hosts." 18 76; then
+        return 0
+    fi
+    NBS=1
+    NBS_HOST=$(nbs_host_default)
+    while :; do
+        v=$(dialog_ --inputbox "This host's unique name in the cluster: lowercase letters, digits and -, up to 63 characters." 12 76 "$NBS_HOST") || return 1
+        if [[ "$v" =~ ^[a-z0-9-]{1,63}$ ]]; then
+            NBS_HOST=$v
+            return 0
+        fi
+        whiptail --title "$TITLE" --msgbox "Use 1 to 63 lowercase letters, digits or -." 10 60
+    done
 }
 
 ask_netconsole() {
@@ -959,7 +1007,7 @@ interactive() {
         : > "$KEYS_FILE"
         chmod 600 "$KEYS_FILE"
         WIPE=1
-        if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && ask_panel && confirm; then
+        if ask_disk && ask_root_size && ask_network && ask_keys && ask_netconsole && ask_panel && ask_nbs && confirm; then
             clear
             if run_install; then
                 the_end "$(done_text)" installed
