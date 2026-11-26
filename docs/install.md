@@ -226,7 +226,7 @@ The kernel's command line is `root=UUID=<the partition> dhcp=auto dns=on
 panic=10` and whatever this machine was given (`--udpshell`, `--netconsole`,
 `--cmdline`) -- `panic=10` resets a nos that panics ten seconds after its
 report, to the server's own system after a one-shot boot. nos mounts the partition read-write as its root, takes
-eth0's settings from `/etc/net.toml` there -- an address by DHCP, or the
+the interfaces' settings from `/etc/net.toml` there -- addresses by DHCP, or the
 static one the install was given ([The network](#the-network)) -- and runs `/etc/rc`, whose `sshd start` makes the host key the
 first time -- from the kernel's entropy pool, into
 `/etc/ssh/ssh_host_ed25519_key`, kept there for every boot after -- and lets
@@ -325,14 +325,12 @@ firmware boot the disk next, once (UEFI's `BootNext`), the order as it was
 after it; `boot --default` puts it first after the network's entries, for
 good; `uninstall` has nothing to take out.
 
-`--network-here` gives nos the network this Linux has: the address of the
-interface its default route leaves by, the route's gateway, its first DNS
-server (`resolv.conf`, or the servers systemd-resolved asks) -- written to
-nos's `/etc/net.toml`. A provider's rescue system is up on the
-server's own address, so its network is the one nos needs on a network with
-no DHCP. nos puts the address on `eth0`, the first network card it drives
-in the bus's order, and `nos-install` says so when that is not the card
-this Linux reaches the network by.
+`--network-here` gives nos the networks this Linux has on every supported
+NIC: static addresses or DHCP, the default route and the additional ones,
+and its first DNS server (`resolv.conf`, or the servers systemd-resolved
+asks) -- written to nos's `/etc/net.toml` in the PCI order nos names them.
+A provider's rescue system is up on the server's own address, so its
+network is the one nos needs on a network with no DHCP.
 
 ### From a provider's rescue system
 
@@ -503,7 +501,7 @@ somewhere else.
 `nos-install rollback` swaps the current kernel, modules, hvboot, CloudHv,
 licenses and `/VERSION` with the `.prev` ones -- back to an image older
 than hvboot, CloudHv or the licenses, none of that. `nos-install status` says what is installed and what was,
-eth0's settings, the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
+the interfaces' settings, the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
 takes `42_nos` out and nos out of the menu, and leaves the partition alone.
 
 From inside a running nos, without Linux, a kernel can be tried before it
@@ -522,47 +520,77 @@ their kernel interface differs. A whole image is updated from Linux.
 
 ## The network
 
-nos's network is `/etc/net.toml` on its root: eth0's address, its gateway,
-its DNS server, or DHCP. `nos-install` writes it -- `install` and `disk`
-whatever they are given, `update` when given `--ip`, `--gw`, `--dns`,
-`--dhcp` or `--network-here` -- and nos reads it at every boot, once the
-root is mounted and before anything goes out: DHCP, the netconsole, sshd.
-It is the strict TOML of a VM's `vm.toml`:
+nos's network is `/etc/net.toml` on its root. `nos-install` writes it --
+`install` and `disk` whatever they are given, `update` when given `--ip`,
+`--gw`, `--dns`, `--dhcp` or `--network-here` -- and nos reads it at every
+boot, once the root is mounted and before anything goes out: DHCP, the
+netconsole, sshd. The original form is eth0's static address, gateway and
+resolver:
 
 ```toml
-# A network with no DHCP server
 ip = "203.0.113.5/24"
 gw = "203.0.113.1"
 dns = "203.0.113.53"
 ```
 
-or `dhcp = true`, which is also what a file without `ip` means: an address
-asked of DHCP at every boot, and the lease's DNS server -- or, with `dns`
-beside it, that server in its place. `dhcp = false` without an `ip` leaves
-eth0 with no address until nos's `dhcp` command is run. Edited from inside
-nos (`edit /etc/net.toml`, over SSH), it is taken at the next boot. `net`
-says what eth0's settings are, and where they came from.
+or `dhcp = true`, which is also what a file without `ip` means. `dhcp =
+false` without an `ip` leaves eth0 with no address until nos's `dhcp`
+command is run. `--ip`, `--gw` and `--dhcp` keep this one-interface form.
 
-The file is taken whole or not at all. A key it does not have, a key given
-twice, an `ip` that is not an address a host may have with its prefix
-length -- or is its subnet's network or broadcast address -- a `gw` that is
-not another address of that subnet, a `gw` with no `ip`, `dhcp = true`
-beside an `ip`: each is refused, the boot says which and on which line,
-and the kernel command line's `ip=`, `gw=`, `dns=` and `dhcp=` are taken in
-its place -- `nos.cfg`'s own `dhcp=auto dns=on`, DHCP, on an installed
-server, which on a network with no DHCP server leaves it unreachable. So
-`nos-install` checks what it writes by the same rules and refuses what nos
-would, before it writes anything.
+Every supported NIC can have its own static address or DHCP client. Names
+are nos's, in PCI order (`02:00.0` is `eth0`, `02:00.1` is `eth1`); the
+Linux interface's name is not carried over. `default` names the interface
+of the default route, and `route_ethN` keeps additional routes through an
+interface, longest prefix first. For example, a host with DHCP inside and a
+static public address outside:
 
-The command line's words are what a root with no `/etc/net.toml` goes by:
-an ISO's, QEMU's, a test's, a root that was not found
-([Kernel parameters](kernel-parameters.md#networking)) -- and a kernel from
-before the file. An install from before it had its network as `ip= gw=
-dns=` in the grubenv's `nos_cmdline`; `update` writes the file from them,
-and keeps them there for as long as a kernel on the partition -- the one
-kept for a rollback, above all -- does not read the file: it looks for
-`/etc/net.toml` in each kernel's image. The update after that, with both
-kernels reading it, takes them out.
+```toml
+dhcp_eth0 = true
+
+ip_eth1 = "94.126.205.237/31"
+gw_eth1 = "94.126.205.236"
+default = "eth1"
+dns = "77.88.8.8"
+
+route_eth0 = ["10.0.0.0/8 via 10.0.0.1", "172.16.0.0/12 via 10.0.0.1",
+              "192.168.0.0/16 via 10.0.0.1"]
+```
+
+A static default interface needs `gw_ethN`; a DHCP one takes the router its
+lease gives it. Static subnets on different interfaces may not overlap. The
+old keys remain equivalent to `ip_eth0`, `gw_eth0` and `dhcp_eth0` (except
+that an empty file retains the original DHCP-on-eth0 behaviour).
+
+`--network-here` maps each supported Linux NIC to nos's PCI order, keeps
+whether its address came by DHCP (`proto dhcp` routes) or is static, the
+default route, every non-default route with a gateway, and the first DNS
+server. A multi-interface install starts sshd on the default interface, so
+an outside address on `eth1` does not need its cable moved. `nos-install
+network` says the default interface's settings for the dialog; `nos-install
+network --toml` prints the whole file it would write. A multi-interface
+update is refused when a kernel kept for rollback does not understand the
+form, rather than leave that rollback unreachable.
+
+Edited from inside nos (`edit /etc/net.toml`, over SSH), the file is taken
+at the next boot. `net` says every interface's settings, the default route
+and the additional routes.
+
+The file is taken whole or not at all. An unknown or repeated key, a bad
+address, prefix, gateway or route, `dhcp = true` beside an address, or a
+default interface with no address or DHCP: each is refused, the boot says
+which and on which line, and the kernel command line's `ip=`, `gw=`, `dns=`
+and `dhcp=` are taken in its place -- `nos.cfg`'s own `dhcp=auto dns=on`,
+DHCP on eth0, on an installed server. So `nos-install` checks what it
+writes by the same rules and refuses what nos would, before it writes
+anything.
+
+The command line's words remain the fallback for a root with no
+`/etc/net.toml`, and configure eth0 alone
+([Kernel parameters](kernel-parameters.md#networking)). An install from
+before the file had its network as `ip= gw= dns=` in the grubenv's
+`nos_cmdline`; `update` writes the file from them, and keeps the words
+while any kernel on the partition lacks `/etc/net.toml` in its image -- the
+next update drops them.
 
 ## What goes where
 
@@ -581,7 +609,7 @@ On the partition, which is nos's root:
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
 | `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
 | `/grubenv` | nos-install | `nos_cmdline`, this machine's kernel parameters; `nos_next`, the one-shot flag |
-| `/etc/net.toml` | nos-install (`--ip`, `--gw`, `--dns`, `--dhcp`, `--network-here`; DHCP where none is given) | eth0's settings, read at every boot ([The network](#the-network)) |
+| `/etc/net.toml` | nos-install (`--ip`, `--gw`, `--dns`, `--dhcp`, `--network-here`; DHCP where none is given) | every interface's settings, read at every boot ([The network](#the-network)) |
 | `/etc/rc` | the image, the first time | the boot script: the machine's after that (`rc` edits it) |
 | `/etc/ssh/authorized_keys` | `--ssh-key` | the keys sshd lets in (`sshd allow` adds one from inside) |
 | `/etc/ssh/ssh_host_ed25519_key` | sshd, at its first start | nos's host key |

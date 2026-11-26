@@ -1,6 +1,7 @@
-//! `netconf`: eth0's settings (`net::settings`) -- `/etc/net.toml`, read off
-//! the root at boot, and the kernel command line's `ip=`, `gw=`, `dns=` and
-//! `dhcp=` in its place where there is no such file or it is refused. Both
+//! `netconf`: every interface's settings (`net::settings`) -- `/etc/net.toml`,
+//! read off the root at boot, and the kernel command line's `ip=`, `gw=`,
+//! `dns=` and `dhcp=` for eth0 in its place where there is no such file or
+//! it is refused. Both
 //! are somebody else's to write: an installer that got a field wrong, a
 //! hand that edited the file, a line typed at GRUB's prompt -- and a wrong
 //! one is a server nobody can reach.
@@ -283,6 +284,7 @@ fn judge_file(lines: &[Line]) -> Result<Settings, usize> {
         lease_dns: true,
         dhcp: if by_dhcp { Dhcp::Boot } else { Dhcp::Command },
         source: Source::File,
+        ..Settings::NONE
     })
 }
 
@@ -294,7 +296,8 @@ fn command_line(r: &mut Input) -> (String, Settings, usize) {
     let mut words = Vec::new();
     let mut ip: Option<(u32, u32)> = None;
     let mut gw: Option<u32> = None;
-    let mut s = Settings { address: None, dns: 0, lease_dns: false, dhcp: Dhcp::Command, source: Source::CommandLine };
+    let mut s = Settings { address: None, dns: 0, lease_dns: false, dhcp: Dhcp::Command, source: Source::CommandLine,
+        ..Settings::NONE };
     let mut refused = 0;
     /* At most four words, so that the line is never cut short: a cut is the
      * C++'s to make, at a whole word, which the machine's line here is not */
@@ -395,6 +398,36 @@ fn sane(s: &Settings, what: &str) {
     }
 }
 
+/* ---- two links, as the dual-homed server has them ---- */
+
+fn two_links() {
+    let text = "dhcp_eth0 = true\n\
+                ip_eth1 = \"94.126.205.237/31\"\n\
+                gw_eth1 = \"94.126.205.236\"\n\
+                dns = \"77.88.8.8\"\n\
+                default = \"eth1\"\n\
+                route_eth0 = [\"10.0.0.0/8 via 10.0.0.1\", \"172.16.0.0/12 via 10.0.0.1\", \
+                              \"192.168.0.0/16 via 10.0.0.1\"]\n";
+    let got = settings::from_file(text).expect("two links");
+    invariant!(got.dhcp == Dhcp::Boot && got.address.is_none() && got.default == 1 && got.dns == 0x4D58_0808,
+               "the inside's DHCP and the default outside: {:?}", got);
+    let outside = got.interface(1);
+    invariant!(outside.dhcp == Dhcp::Command
+        && outside.address == Some(Address { ip: 0x5E7E_CDED, mask: 0xFFFF_FFFE, gw: 0x5E7E_CDEC }),
+        "the static /31 outside: {:?}", outside);
+    let nets: Vec<(u32, u32)> = got.routes[..got.route_count].iter().flatten().map(|r| (r.net, r.mask)).collect();
+    invariant!(nets == [(0x0A00_0000, 0xFF00_0000), (0xAC10_0000, 0xFFF0_0000), (0xC0A8_0000, 0xFFFF_0000)]
+        && got.routes[..got.route_count].iter().flatten().all(|r| r.dev == 0 && r.gw == 0x0A00_0001),
+        "the private routes: {:?}", got.routes);
+    for bad in [
+        "default = \"eth1\"",
+        "ip = \"10.0.0.2/24\"\nip_eth1 = \"10.0.0.3/24\"",
+        "ip = \"10.0.0.2/24\"\nroute_eth0 = [\"192.168.0.0/16 via 10.0.1.1\"]",
+    ] {
+        invariant!(settings::from_file(bad).is_err(), "refused: {}", bad);
+    }
+}
+
 /* ---- the boot's own step ---- */
 
 /// Nobody on the wire: this target sends nothing.
@@ -437,6 +470,7 @@ fn boot(root: Root, words: &'static str) -> (Settings, Option<String>) {
 }
 
 pub fn netconf(r: &mut Input) {
+    two_links();
     let (line, line_settings, line_refused) = command_line(r);
     let mut named = 0;
     let got = settings::from_command_line(line.as_bytes(), &mut |_, _, _| named += 1);

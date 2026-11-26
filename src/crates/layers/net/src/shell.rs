@@ -14,7 +14,7 @@ use kcore::task;
 use kcore::time::Duration;
 
 use crate::abi;
-use crate::device::{Device, DEVICES};
+use crate::device::DEVICES;
 use crate::dns::MAX_DOMAIN_LEN;
 use crate::frame::{self, POOL};
 use crate::netconsole::NETCONSOLE;
@@ -29,17 +29,6 @@ const DEFAULT_DEVICE: &str = "eth0";
 /// A dotted quad the shell was given, into host byte order.
 fn parse_ip(text: &str) -> Option<u32> {
     crate::wire::parse_ipv4(text.as_bytes())
-}
-
-/// The device a command works on, or None with the reason said.
-fn device(name: &str, out: &mut Output) -> Option<&'static Device> {
-    match DEVICES.find(name.as_bytes()) {
-        Some(dev) => Some(dev),
-        None => {
-            let _ = writeln!(out, "no network device");
-            None
-        }
-    }
 }
 
 /* ---- what the counters say ---- */
@@ -77,8 +66,8 @@ pub fn net(_args: &str, out: &mut Output) {
     let (polls, work, stalls) = DEVICES.poll_counts();
     let _ = writeln!(out, "rx polls {}, poll work {}, stalls {}", polls, work, stalls);
 
-    /* What the boot gave eth0, and from where: edited, /etc/net.toml is
-     * read again at the next boot */
+    /* What the boot gave every interface, and from where: edited,
+     * /etc/net.toml is read again at the next boot */
     let given = settings::current();
     let _ = match (given.source, settings::refused()) {
         (settings::Source::File, _) => writeln!(out, "{} settings: {} ({})", DEFAULT_DEVICE, given, settings::PATH),
@@ -87,6 +76,20 @@ pub fn net(_args: &str, out: &mut Output) {
         (_, None) => writeln!(out, "{} settings: {} (the command line's: no {})", DEFAULT_DEVICE, given,
             settings::PATH),
     };
+    for index in 1..settings::MAX_INTERFACES {
+        let interface = given.interface(index);
+        if interface.address.is_none() && interface.dhcp != Dhcp::Boot {
+            continue;
+        }
+        let _ = writeln!(out, "eth{} settings: {} ({})", index, interface, settings::PATH);
+    }
+    if given.default != 0 {
+        let _ = writeln!(out, "default route: eth{}", given.default);
+    }
+    for route in given.routes[..given.route_count].iter().flatten() {
+        let _ = writeln!(out, "route {}/{} via {} dev eth{}", Ip(route.net), route.mask.count_ones(),
+            Ip(route.gw), route.dev);
+    }
 }
 
 pub fn netpool(args: &str, out: &mut Output) {
@@ -259,7 +262,10 @@ pub fn udpsend(args: &str, out: &mut Output) {
         None => { let _ = writeln!(out, "invalid IP '{}'", ip_text); return; }
     };
 
-    let dev = match device(DEFAULT_DEVICE, out) { Some(dev) => dev, None => return };
+    let dev = match DEVICES.route(dst) {
+        Some(dev) => dev,
+        None => { let _ = writeln!(out, "no route to {}", Ip(dst)); return; }
+    };
 
     let arp = match abi::arp_table() { Some(arp) => arp, None => return };
 
@@ -302,11 +308,10 @@ pub fn ping(args: &str, out: &mut Output) {
         },
     };
 
-    /* Out of the device whose subnet it is on -- a guest's, behind hv0 --
-     * else the default one, whose gateway reaches the rest. */
-    let dev = match DEVICES.on_subnet(dst) {
+    /* The connected or additional route to it, else the configured default. */
+    let dev = match DEVICES.route(dst) {
         Some(dev) => dev,
-        None => match device(DEFAULT_DEVICE, out) { Some(dev) => dev, None => return },
+        None => { let _ = writeln!(out, "no route to {}", Ip(dst)); return; }
     };
     let (icmp, arp) = match (abi::icmp(), abi::arp_table()) {
         (Some(icmp), Some(arp)) => (icmp, arp),
@@ -372,19 +377,22 @@ pub fn dnsflush(_args: &str, out: &mut Output) {
 }
 
 pub fn dhcp(args: &str, out: &mut Output) {
-    let settings = settings::current();
-    if settings.dhcp == Dhcp::Off {
-        let _ = writeln!(out, "DHCP disabled (dhcp=off)");
-        return;
-    }
-
     let name = args.split_whitespace().next().unwrap_or(DEFAULT_DEVICE);
     let dev = match DEVICES.find(name.as_bytes()) {
         Some(dev) => dev,
         None => { let _ = writeln!(out, "device '{}' not found", name); return; }
     };
+    let configured = dev.eth_index().map(|index| settings::current().interface(index).dhcp);
+    if configured == Some(Dhcp::Off) {
+        if name == DEFAULT_DEVICE {
+            let _ = writeln!(out, "DHCP disabled (dhcp=off)");
+        } else {
+            let _ = writeln!(out, "DHCP disabled on {}", name);
+        }
+        return;
+    }
 
-    let client = match abi::dhcp() { Some(client) => client, None => return };
+    let client = match abi::dhcp(dev) { Some(client) => client, None => return };
 
     if client.is_ready() {
         let _ = writeln!(out, "already bound: {}", Ip(client.lease().ip));
@@ -417,7 +425,7 @@ pub fn dhcp(args: &str, out: &mut Output) {
     let _ = writeln!(out, "dns:    {}", Ip(lease.dns));
     let _ = writeln!(out, "lease:  {} seconds", lease.lease_secs);
 
-    if settings.lease_dns && lease.dns != 0 {
+    if settings::current().lease_dns && lease.dns != 0 {
         if let Some(dns) = abi::dns() {
             if !dns.is_ready() && dns.start(dev.as_nic(), lease.dns) {
                 let _ = writeln!(out, "DNS resolver started, server: {}", Ip(lease.dns));
@@ -457,106 +465,116 @@ pub fn register_all() {
 
 /* ---- what boot asks of the layer ---- */
 
-/// The shell's task, as it starts: where eth0's settings ask DHCP for its
-/// address at boot -- `/etc/net.toml`'s `dhcp`, or the command line's
-/// `dhcp=auto` (`settings`) -- a DHCP client on eth0, and a resolver on
-/// whatever server the lease names. What it prints goes to the console the
-/// shell is about to take.
+/// The shell's task, as it starts: every interface whose settings ask DHCP
+/// at boot gets its own client. They run together, and the default
+/// interface's lease names the resolver first. What it prints goes to the
+/// console the shell is about to take.
 ///
 /// # Safety
 /// `printer` is a `stdlib::Printer*` that outlives the call.
 #[no_mangle]
 pub unsafe extern "C" fn rust_net_dhcp_auto(printer: *mut core::ffi::c_void) {
     let mut out = unsafe { Output::from_raw(printer) };
-
     let settings = settings::current();
-    if settings.dhcp != Dhcp::Boot {
-        return;
-    }
-    /* A static address is the whole of eth0's configuration: a lease would
-     * take its place, and on the network it was given for nobody answers.
-     * Only the command line can ask for both; the file refuses that. */
-    if let Some(given) = settings.address {
-        let _ = writeln!(out, "DHCP auto: {} has a static address, {}", DEFAULT_DEVICE, Ip(given.ip));
-        return;
-    }
+    let mut started = Vec::new();
 
-    let dev = match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
-        Some(dev) => dev,
-        /* No device: nothing to say, as the C++ said nothing either. */
-        None => return,
-    };
-    let client = match abi::dhcp() { Some(client) => client, None => return };
-
-    let _ = writeln!(out, "DHCP auto on {}...", DEFAULT_DEVICE);
-    if !client.start(dev.as_nic()) {
-        let _ = writeln!(out, "DHCP auto failed");
-        return;
+    for index in 0..settings::MAX_INTERFACES {
+        let interface = settings.interface(index);
+        if interface.dhcp != Dhcp::Boot {
+            continue;
+        }
+        if let Some(given) = interface.address {
+            let _ = writeln!(out, "DHCP auto: eth{} has a static address, {}", index, Ip(given.ip));
+            continue;
+        }
+        let Some(dev) = DEVICES.find_eth(index) else { continue };
+        let Some(client) = abi::dhcp(dev) else { continue };
+        let _ = writeln!(out, "DHCP auto on eth{}...", index);
+        if !client.start(dev.as_nic()) {
+            let _ = writeln!(out, "DHCP auto failed on eth{}", index);
+            continue;
+        }
+        started.push((index, dev, client));
     }
 
     for _ in 0..100 {
-        if client.is_ready() {
+        if started.iter().all(|(_, _, client)| client.is_ready()) {
             break;
         }
         task::sleep(Duration::from_millis(100));
     }
-    if !client.is_ready() {
-        let _ = writeln!(out, "DHCP auto timeout");
-        return;
+
+    for &(index, _, client) in &started {
+        if !client.is_ready() {
+            let _ = writeln!(out, "DHCP auto timeout on eth{}", index);
+            continue;
+        }
+        if started.len() == 1 {
+            let _ = writeln!(out, "DHCP ip: {}", Ip(client.lease().ip));
+        } else {
+            let _ = writeln!(out, "DHCP ip: {} (eth{})", Ip(client.lease().ip), index);
+        }
     }
-
-    let lease = client.lease();
-    let _ = writeln!(out, "DHCP ip: {}", Ip(lease.ip));
-
-    if settings.lease_dns && lease.dns != 0 {
-        if let Some(dns) = abi::dns() {
-            if dns.start(dev.as_nic(), lease.dns) {
-                let _ = writeln!(out, "DNS resolver started, server: {}", Ip(lease.dns));
+    for preferred in [true, false] {
+        for &(index, dev, client) in &started {
+            if (index == settings.default) != preferred || !client.is_ready() {
+                continue;
+            }
+            let lease = client.lease();
+            if !settings.lease_dns || lease.dns == 0 {
+                continue;
+            }
+            if let Some(dns) = abi::dns() {
+                if !dns.is_ready() && dns.start(dev.as_nic(), lease.dns) {
+                    let _ = writeln!(out, "DNS resolver started, server: {}", Ip(lease.dns));
+                }
             }
         }
     }
 }
 
-/// On the way down: the client stops asking for a lease.
+/// On the way down: every client stops asking for a lease.
 #[no_mangle]
 pub extern "C" fn rust_net_dhcp_stop() {
-    if let Some(client) = abi::dhcp() {
-        client.stop();
-    }
+    abi::dhcp_stop_all();
 }
 
-/// A static address -- `/etc/net.toml`'s `ip` and `gw`, or the command
-/// line's `ip=` and `gw=`: put on eth0 before anything that sends -- the
-/// netconsole first, which waits for an address and has none on a network
+/// Every static address, put on its interface before anything that sends --
+/// the netconsole first, which waits for an address and has none on a network
 /// with no DHCP server. The mask and the gateway go first and the address
 /// last: an address is what everything here takes for a device ready to
 /// send from, and each is read with the order its store made.
 fn configure_static() {
-    let Some(given) = settings::current().address else { return };
-    let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
-        kcore::klog!(0, "net: eth0's settings give it a static address, but there is no {} to put it on",
-            DEFAULT_DEVICE);
-        return;
-    };
-    let nic = dev.as_nic();
-    nic.set_mask(given.mask);
-    nic.set_gw(given.gw);
-    nic.set_ip(given.ip);
-    kcore::klog!(0, "net: {} static ip {} mask {} gw {}", DEFAULT_DEVICE, Ip(given.ip), Ip(given.mask),
-        Ip(given.gw));
+    let settings = settings::current();
+    for index in 0..settings::MAX_INTERFACES {
+        let Some(given) = settings.interface(index).address else { continue };
+        let Some(dev) = DEVICES.find_eth(index) else {
+            kcore::klog!(0, "net: eth{}'s settings give it a static address, but there is no such device", index);
+            continue;
+        };
+        let nic = dev.as_nic();
+        nic.set_mask(given.mask);
+        nic.set_gw(given.gw);
+        nic.set_ip(given.ip);
+        kcore::klog!(0, "net: eth{} static ip {} mask {} gw {}", index, Ip(given.ip), Ip(given.mask), Ip(given.gw));
+    }
+    if settings.is_multi() && DEVICES.default_device().is_none() {
+        kcore::klog!(0, "net: the default route is on eth{}, which is not registered", settings.default);
+    }
 }
 
 /// A resolver's server given -- `/etc/net.toml`'s `dns`, or the command
-/// line's `dns=A.B.C.D`: the resolver on it from the start, on eth0 -- with
-/// a static address or a lease to come, whose own server then does not
-/// replace it.
+/// line's `dns=A.B.C.D`: the resolver on it from the start, on the default
+/// route's interface -- with a static address or a lease to come, whose own
+/// server then does not replace it.
 fn start_given_resolver() {
-    let server = settings::current().dns;
+    let settings = settings::current();
+    let server = settings.dns;
     if server == 0 {
         return;
     }
-    let Some(dev) = DEVICES.find(DEFAULT_DEVICE.as_bytes()) else {
-        kcore::klog!(0, "dns: eth0's settings give it a resolver, but there is no {} to resolve on", DEFAULT_DEVICE);
+    let Some(dev) = DEVICES.default_device() else {
+        kcore::klog!(0, "dns: the settings give a resolver, but there is no eth{} to resolve on", settings.default);
         return;
     };
     match abi::dns() {
@@ -570,9 +588,9 @@ fn start_given_resolver() {
 }
 
 /// The services boot starts once the devices are up and the shell exists:
-/// eth0's static address where its settings give one, and its resolver;
-/// the netconsole, if the command line asked for one, and the shell over
-/// UDP. Both go on eth0, which is what the C++ looked for.
+/// every static address, and the resolver on the default interface; the
+/// netconsole, if the command line asked for one, and the shell over UDP.
+/// Those two stay on eth0, which is what the C++ looked for.
 #[no_mangle]
 pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
     configure_static();

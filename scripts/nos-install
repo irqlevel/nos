@@ -6,8 +6,10 @@
 #   nos-install install <partition> [options]    put the image on <partition>
 #   nos-install disk <disk> [options]            make <disk> nos's own
 #   nos-install disks                            the disks here, for disk
-#   nos-install network                          this Linux's network, as
-#                                                --network-here gives it nos
+#   nos-install network [--toml]                 this Linux's network, as
+#                                                --network-here gives it nos;
+#                                                --toml prints every interface's
+#                                                settings, not just the default's
 #   nos-install update [<partition>] [options]   a new image over the one there
 #   nos-install rollback [<partition>]           back to the image before it
 #   nos-install boot [<partition>] [--reboot]    boot nos once, the next time
@@ -48,9 +50,9 @@
 #   --dns A.B.C.D         the DNS server nos asks (with --dhcp, or neither,
 #                         the one it asks in place of the DHCP lease's)
 #   --dhcp                nos's address by DHCP, at every boot
-#   --network-here        nos's address, gateway and DNS server as this Linux
-#                         has them now: a provider's rescue system's are the
-#                         server's, on a network with no DHCP
+#   --network-here        every supported NIC's static address or DHCP, the
+#                         default route, additional routes and DNS server as
+#                         this Linux has them now, mapped by nos's PCI order
 #   --panel               the management panel: a VM of nos's that manages it
 #                         in a browser, at https://<this machine>:39233, as
 #                         root -- with a password made now and printed once.
@@ -67,7 +69,7 @@
 # them, which then replace the lot (--cmdline "" clears them).
 #
 # --ip, --gw, --dns, --dhcp and --network-here write /etc/net.toml on the
-# root: eth0's settings, which nos reads at every boot (docs/install.md).
+# root: every interface's settings, which nos reads at every boot (docs/install.md).
 # install and disk write one whatever they are given -- DHCP where none of
 # them is -- and update keeps the one there unless given any of them; an
 # update of an install from before the file writes it from the ip=, gw=,
@@ -571,14 +573,17 @@ EXTRA=
 SET_CMDLINE=0
 CMDLINE=
 NETWORK_HERE=0
-# eth0's settings for /etc/net.toml (--ip, --gw, --dns, --dhcp,
-# --network-here): NET_MODE static (NET_IP, with NET_GW), dhcp, or manual --
-# no address until nos's `dhcp` command, which only a grubenv's dhcp=on
-# says -- and NET_DNS the resolver, given; SET_NETWORK 1 where an option says
+NETWORK_TOML=0
+# The interfaces' settings for /etc/net.toml (--ip, --gw, --dns, --dhcp,
+# --network-here): NET_MODE static (NET_IP, with NET_GW), dhcp, manual, or
+# multi (NET_MULTI_TOML and NET_DEFAULT) -- and NET_DNS the resolver, given;
+# SET_NETWORK 1 where an option says
 NET_MODE=
 NET_IP=
 NET_GW=
 NET_DNS=
+NET_DEFAULT=eth0
+NET_MULTI_TOML=
 SET_NETWORK=0
 # Where the settings are on the root, and the literal a kernel that reads
 # them has in its image (src/crates/layers/net/src/settings.rs, PATH)
@@ -590,14 +595,14 @@ nic_pci() {
     basename "$(readlink -f "/sys/class/net/$1/device" 2>/dev/null)" 2>/dev/null | grep -E '^[0-9a-f]{4}:' || true
 }
 
-# ip=, gw= and dns= for nos as this Linux has its network now: the address
-# of the interface its default route leaves by, that route's gateway, its
-# first DNS server -- a provider's rescue system's are the server's, which a
-# network with no DHCP server gives nobody else. nos puts the address on its
-# eth0, the first card it drives in the bus's order: one that is not the
-# card this Linux reaches the network by is a port with no link, said
-network_here() {
-    local route gw dev addr dns pci first
+# This Linux's supported interfaces as records, in nos's PCI order:
+# default|ethN; dns|A.B.C.D; nic|ethN|static|address/prefix|gateway|Linux name;
+# nic|ethN|dhcp|address/prefix|router|Linux name; route|ethN|network/prefix|gateway.
+# A DHCP lease's current address is in the record for the summary, not written
+# as a static one. Every non-default route with a gateway is kept.
+network_here_data() {
+    local route gw dev addr dns pci first link name mode nicgw target via
+    local nics=() i n default_eth= recorded=
     need ip
     route=$(ip -4 route show default 2>/dev/null | head -n 1)
     gw=$(printf '%s\n' "$route" | sed -n 's/.* via \([0-9.]*\).*/\1/p')
@@ -605,8 +610,6 @@ network_here() {
     [ -n "$gw" ] && [ -n "$dev" ] || die "--network-here: this Linux has no default route through a gateway"
     addr=$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{ print $4; exit }')
     [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "--network-here: $dev has no IPv4 address"
-    # resolv.conf's first server -- unless it is systemd-resolved's stub, which
-    # is this Linux's own: then the servers the stub asks
     dns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)
     case "$dns" in
         ''|127.*)
@@ -616,16 +619,140 @@ network_here() {
                 grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true) ;;
     esac
     [ -n "$dns" ] || die "--network-here: no DNS server this Linux uses was found (resolv.conf, systemd-resolved)"
+
+    mapfile -t nics < <(nos_nics)
     pci=$(nic_pci "$dev")
-    first=$(nos_nics | head -n 1)
-    if [ -n "$pci" ] && [ -n "$first" ] && [ "$pci" != "$first" ]; then
-        warn "--network-here: this Linux reaches the network by $dev ($pci), but nos puts the address on its eth0, the first card it drives ($first): a port with no cable leaves nos unreachable"
+    for i in "${!nics[@]}"; do
+        [ "${nics[$i]}" != "$pci" ] || default_eth=eth$i
+    done
+    if [ -z "$default_eth" ] && [ -n "$pci" ]; then
+        die "--network-here: the default route is on $dev ($pci), which nos does not drive"
     fi
-    say "the network as this Linux has it, on $dev: $addr, gateway $gw, DNS $dns" >&2
-    echo "ip=$addr gw=$gw dns=$dns"
+    # A container's or another non-PCI default interface is eth0 as it was.
+    default_eth=${default_eth:-eth0}
+    printf 'default|%s\ndns|%s\n' "$default_eth" "$dns"
+
+    for i in "${!nics[@]}"; do
+        pci=${nics[$i]}
+        for link in /sys/class/net/*; do
+            [ -e "$link" ] || continue
+            name=${link##*/}
+            [ "$(nic_pci "$name")" = "$pci" ] || continue
+            addr=$(ip -4 -o addr show dev "$name" scope global 2>/dev/null | awk '{ print $4; exit }')
+            [ -n "$addr" ] || continue
+            mode=static
+            [ -z "$(ip -4 route show dev "$name" proto dhcp 2>/dev/null)" ] || mode=dhcp
+            nicgw=
+            if [ "$name" = "$dev" ]; then
+                nicgw=$gw
+            else
+                nicgw=$(ip -4 route show dev "$name" 2>/dev/null | awk '$2 == "via" { print $3; exit }')
+            fi
+            printf 'nic|eth%s|%s|%s|%s|%s\n' "$i" "$mode" "$addr" "$nicgw" "$name"
+            [ "$name" != "$dev" ] || recorded=1
+        done
+    done
+    if [ -z "$recorded" ]; then
+        mode=static
+        [ -z "$(ip -4 route show dev "$dev" proto dhcp 2>/dev/null)" ] || mode=dhcp
+        printf 'nic|%s|%s|%s|%s|%s\n' "$default_eth" "$mode" "$addr" "$gw" "$dev"
+    fi
+    while read -r target via n; do
+        [ -n "$n" ] || continue
+        pci=$(nic_pci "$n")
+        default_eth=
+        for i in "${!nics[@]}"; do
+            [ "${nics[$i]}" != "$pci" ] || default_eth=eth$i
+        done
+        [ -n "$default_eth" ] || continue
+        printf 'route|%s|%s|%s\n' "$default_eth" "$target" "$via"
+    done < <(ip -4 route show 2>/dev/null | awk '$2 == "via" && $1 != "default" { print $1, $3, $5 }')
 }
 
-# ---- eth0's settings: /etc/net.toml ------------------------------------
+# The old, one-line summary for the dialog and for a one-interface install.
+network_here_summary() {
+    local data=$1 kind a b c d e default=eth0 dns= addr= gw=
+    while IFS='|' read -r kind a b c d e; do
+        case "$kind" in
+            default) default=$a ;;
+            dns) dns=$a ;;
+            nic)
+                [ "$a" = "$default" ] || continue
+                addr=$c
+                gw=$d ;;
+        esac
+    done <<<"$data"
+    [ -z "$addr" ] || printf 'ip=%s ' "$addr"
+    [ -z "$gw" ] || printf 'gw=%s ' "$gw"
+    printf 'dns=%s\n' "$dns"
+}
+
+network_here() {
+    local data
+    data=$(network_here_data)
+    network_here_summary "$data"
+}
+
+network_here_is_multi() {
+    local data=$1 kind a b c d e default=eth0 nics=0
+    while IFS='|' read -r kind a b c d e; do
+        case "$kind" in
+            default) default=$a ;;
+            nic) nics=$((nics + 1)) ;;
+            route) return 0 ;;
+        esac
+    done <<<"$data"
+    [ "$default" != eth0 ] || [ "$nics" -gt 1 ]
+}
+
+# /etc/net.toml's new per-interface form, or the original one when this
+# Linux has one interface and no additional routes.
+network_here_toml() {
+    local data=$1 kind a b c d e default=eth0 dns= multi=0 routes=()
+    if network_here_is_multi "$data"; then
+        multi=1
+    fi
+    while IFS='|' read -r kind a b c d e; do
+        case "$kind" in
+            default) default=$a ;;
+            dns) dns=$a ;;
+            nic)
+                if [ "$multi" = 0 ]; then
+                    case "$b" in
+                        static)
+                            printf 'ip = "%s"\n' "$c"
+                            [ -z "$d" ] || printf 'gw = "%s"\n' "$d" ;;
+                        dhcp) printf 'dhcp = true\n' ;;
+                    esac
+                else
+                    case "$b" in
+                        static)
+                            printf 'ip_%s = "%s"\n' "$a" "$c"
+                            [ -z "$d" ] || printf 'gw_%s = "%s"\n' "$a" "$d" ;;
+                        dhcp) printf 'dhcp_%s = true\n' "$a" ;;
+                    esac
+                fi ;;
+            route) routes+=("$a|$b|$c") ;;
+        esac
+    done <<<"$data"
+    [ -z "$dns" ] || printf 'dns = "%s"\n' "$dns"
+    [ "$multi" = 0 ] || printf 'default = "%s"\n' "$default"
+    local r dev net gw seen=() line
+    for r in ${routes[@]+"${routes[@]}"}; do
+        IFS='|' read -r dev net gw <<<"$r"
+        case " ${seen[*]-} " in *" $dev "*) continue ;; esac
+        seen+=("$dev")
+        line=
+        for r in ${routes[@]+"${routes[@]}"}; do
+            IFS='|' read -r a b c <<<"$r"
+            [ "$a" = "$dev" ] || continue
+            line+="${line:+, }\"$b via $c\""
+        done
+        printf 'route_%s = [%s]\n' "$dev" "$line"
+    done
+}
+
+# ---- the interfaces' settings: /etc/net.toml -----------------------------
 #
 # What nos takes is what its kernel takes (net::settings): these checks are
 # its rules, so that nothing is written the kernel would refuse -- a refused
@@ -720,6 +847,7 @@ gw_wrong() {
 # would refuse the file for
 net_wrong() {
     local why
+    [ "$NET_MODE" != multi ] || return 0
     if [ "$NET_MODE" = static ]; then
         why=$(ip_wrong "$NET_IP")
         [ -z "$why" ] || { echo "the address $NET_IP $why"; return 0; }
@@ -737,12 +865,17 @@ net_wrong() {
 # The options' settings checked, and --network-here's taken: before anything
 # is written
 compose_network() {
-    local here words=() w why
+    local here data kind value rest words=() w why
     if [ "$NETWORK_HERE" = 1 ]; then
         [ -z "$NET_IP" ] && [ -z "$NET_GW" ] && [ "$NET_MODE" != dhcp ] ||
-            die "--network-here is this Linux's address and gateway: not with --ip, --gw or --dhcp"
+            die "--network-here is this Linux's addresses and routes: not with --ip, --gw or --dhcp"
         # An assignment of its own, so that its die ends the run
-        here=$(network_here)
+        data=$(network_here_data)
+        here=$(network_here_summary "$data")
+        while IFS='|' read -r kind value rest; do
+            [ "$kind" = default ] || continue
+            NET_DEFAULT=$value
+        done <<<"$data"
         read -r -a words <<<"$here"
         for w in "${words[@]}"; do
             case "$w" in
@@ -751,6 +884,7 @@ compose_network() {
                 dns=*) [ -n "$NET_DNS" ] || NET_DNS=${w#dns=} ;;
             esac
         done
+        NET_MULTI_TOML=$(network_here_toml "$data")
     fi
     if [ -n "$NET_IP" ]; then
         [ "$NET_MODE" != dhcp ] || die "--ip and --dhcp: nos's address is the one given, or DHCP's"
@@ -760,6 +894,13 @@ compose_network() {
     elif [ "$SET_NETWORK" = 1 ]; then
         # --dhcp, or --dns alone: DHCP with that resolver
         NET_MODE=dhcp
+    fi
+    if [ "$NETWORK_HERE" = 1 ] && network_here_is_multi "$data"; then
+        NET_MODE=multi
+    elif [ "$NETWORK_HERE" = 1 ] && [[ "$NET_MULTI_TOML" == *"dhcp = true"* ]]; then
+        NET_MODE=dhcp
+        NET_IP=
+        NET_GW=
     fi
     why=$(net_wrong)
     [ -z "$why" ] || die "nos's network: $why"
@@ -771,6 +912,7 @@ compose_network() {
 # What the settings in NET_* come to, said
 net_said() {
     case "$NET_MODE" in
+        multi) echo "$NET_IP${NET_GW:+, gateway $NET_GW}${NET_DNS:+, DNS $NET_DNS}, default $NET_DEFAULT, the other interface's settings and routes in $NET_TOML_PATH" ;;
         static) echo "$NET_IP${NET_GW:+, gateway $NET_GW}${NET_DNS:+, DNS $NET_DNS}" ;;
         manual) echo "no address until nos's dhcp command${NET_DNS:+, DNS $NET_DNS}" ;;
         *) echo "DHCP${NET_DNS:+, DNS $NET_DNS}" ;;
@@ -779,6 +921,13 @@ net_said() {
 
 # /etc/net.toml's text for the settings in NET_* (net::settings reads it)
 net_toml_text() {
+    if [ "$NET_MODE" = multi ]; then
+        echo "# Interfaces by nos's PCI order. dhcp_ethN, or ip_ethN with an optional"
+        echo "# gw_ethN; default is the default route's interface. route_ethN holds"
+        echo "# additional networks. Changed here, they are taken at the next boot."
+        printf '%s\n' "$NET_MULTI_TOML"
+        return 0
+    fi
     echo "# eth0's settings, read by nos at every boot: a static address -- ip,"
     echo "# with its gateway, gw -- or DHCP; dns, the DNS server, where one is"
     echo "# given. Changed here, they are taken at the next boot (docs/install.md)."
@@ -796,6 +945,7 @@ net_toml_text() {
 # /etc/net.toml reads in its place. DHCP is nos.cfg's own dhcp=auto dns=on
 net_words() {
     case "$NET_MODE" in
+        multi) echo "" ;;
         static) echo "ip=$NET_IP${NET_GW:+ gw=$NET_GW}${NET_DNS:+ dns=$NET_DNS}" ;;
         manual) echo "dhcp=on${NET_DNS:+ dns=$NET_DNS}" ;;
         *) echo "${NET_DNS:+dns=$NET_DNS}" ;;
@@ -873,7 +1023,32 @@ kernels_read_net_toml() {
     done
 }
 
-# eth0's settings on the root at $1: /etc/net.toml as the options say; else
+# Every kernel a boot may choose understands the per-interface file too. An
+# older rollback would refuse it and have no external address of its own.
+kernels_read_multi_net_toml() {
+    local k
+    for k in "$1/boot/kernel64.elf" "$1/boot/kernel64.elf.prev" "$1/boot/kernel64.elf.next"; do
+        [ -e "$k" ] || continue
+        grep -qaF "net.toml multi-NIC v2" "$k" || return 1
+    done
+}
+
+# The default interface is also where a new installation's sshd listens.
+# Only the stock command (or one written by an earlier such install) is
+# replaced; a custom port or another command is the owner's.
+put_ssh_nic() {
+    local rc=$1/etc/rc
+    [ "$NET_MODE" = multi ] || return 0
+    [ -f "$rc" ] || return 0
+    sed -E "s/^sshd start( 22 nic=eth[0-9]+)?$/sshd start 22 nic=$NET_DEFAULT/" "$rc" > "$rc.new"
+    if ! cmp -s "$rc" "$rc.new"; then
+        mv -T "$rc.new" "$rc"
+        say "/etc/rc: sshd start 22 nic=$NET_DEFAULT, the default route's interface"
+    fi
+    rm -f "$rc.new"
+}
+
+# The interfaces' settings on the root at $1: /etc/net.toml as the options say; else
 # the one there, kept; else -- an install from before the file -- written
 # from the kernel parameters it had, $2; else DHCP, which is what nos.cfg's
 # own dhcp=auto dns=on had it ask. Then the kernel parameters: while a
@@ -882,6 +1057,9 @@ kernels_read_net_toml() {
 put_network() {
     local mnt=$1 before=$2 file=$1/$NET_TOML wrote=0 now rest words new
     mkdir -p "$mnt/etc"
+    if [ "$NET_MODE" = multi ] && ! kernels_read_multi_net_toml "$mnt"; then
+        die "a multi-interface $NET_TOML_PATH needs every kernel on $PART to support it: update once with the old settings, then again with --network-here"
+    fi
     if [ "$SET_NETWORK" = 1 ]; then
         wrote=1
     elif [ -f "$file" ]; then
@@ -904,6 +1082,7 @@ put_network() {
         mv -T "$file.new" "$file"
         say "$NET_TOML_PATH: $(net_said)"
     fi
+    put_ssh_nic "$mnt"
 
     now=$(editenv "$mnt/grubenv" list | sed -n 's/^nos_cmdline=//p')
     rest=$(other_words_in "$now")
@@ -1861,6 +2040,7 @@ parse_options() {
             --wipe) WIPE=1 ;;
             --dry-run) DRY_RUN=1 ;;
             --network-here) NETWORK_HERE=1; SET_NETWORK=1 ;;
+            --toml) NETWORK_TOML=1 ;;
             --ip) [ $# -ge 2 ] || usage; NET_IP=$2; SET_NETWORK=1; shift ;;
             --ip=*) NET_IP=${1#*=}; SET_NETWORK=1 ;;
             --gw) [ $# -ge 2 ] || usage; NET_GW=$2; SET_NETWORK=1; shift ;;
@@ -2230,9 +2410,13 @@ case "$COMMAND" in
         [ -z "$PART" ] || die "disks takes no device: it lists them"
         cmd_disks ;;
     network)
-        only_options
+        only_options --toml
         [ -z "$PART" ] || die "network takes no device: it says this Linux's"
-        network_here ;;
+        if [ "$NETWORK_TOML" = 1 ]; then
+            network_here_toml "$(network_here_data)"
+        else
+            network_here
+        fi ;;
     boot) only_options --reboot --boot-once --default; cmd_boot ;;
     rollback|status|uninstall) only_options; "cmd_$COMMAND" ;;
     *) die "no command $COMMAND (--help)" ;;
