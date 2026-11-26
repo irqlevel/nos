@@ -426,7 +426,7 @@ sshd start 22 nic=eth1
           p.returncode == 0 and p.stdout == want, "rc %d, got %r, want %r%s" % (p.returncode, p.stdout, want, p.stderr[-500:]))
 
 
-PANEL_FUNCTIONS = ("add_answer", "run_install", "unattended", "ask_panel", "interactive")
+PANEL_FUNCTIONS = ("add_answer", "run_install", "unattended", "ask_panel", "ask_nbs", "nbs_host_default", "interactive")
 
 
 def panel_choices(tmp):
@@ -449,6 +449,7 @@ def panel_choices(tmp):
         f.write(r"""set -uo pipefail
 mode=$1
 choice=$2
+nbs=${3:-no}
 . /n/fns.sh
 TITLE="nos installer"
 ON_ISO=0
@@ -464,12 +465,16 @@ NOS_NET=(--dhcp)
 NOS_CMDLINE=
 NETCONSOLE=
 PANEL=0
+NBS=0
+NBS_HOST=
 RESCUE_LINE=
 declare -A ANS=([disk]=/dev/test [wipe]=yes [after]=stay)
 KEYS=()
 KEY_URLS=()
-say() { :; }
+say() { printf '%s\n' "$*"; }
 kmsg() { :; }
+hostname() { echo Rescue_Node; }
+dialog_() { echo node1; }
 image_version() { echo test; }
 wait_carrier() { :; }
 net_dhcp_chosen() { NOS_NET=(--dhcp); }
@@ -491,32 +496,52 @@ ask_netconsole() { :; }
 confirm() { :; }
 done_text() { echo done; }
 the_end() { exit 0; }
-whiptail() { [ "$choice" = yes ]; }
+whiptail() {
+    case " $* " in
+        *" Enable NBS "*) [ "$nbs" = yes ] ;;
+        *) [ "$choice" = yes ] ;;
+    esac
+}
 if [ "$mode" = dialog ]; then
     interactive
 else
     [ "$choice" = default ] || add_answer panel "$choice"
+    if [ "$nbs" != no ]; then
+        add_answer nbs yes
+        [ "$nbs" = default ] || add_answer nbs_host node1
+    fi
     unattended
 fi
 """)
     p = subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", where + ":/n",
                         INSTALLER_ALPINE, "sh", "-c",
                         "apk add -q bash >/dev/null && "
-                        "bash /n/run.sh dialog yes && bash /n/run.sh dialog no && "
-                        "bash /n/run.sh answers yes && bash /n/run.sh answers no && "
-                        "bash /n/run.sh answers default && "
+                        "bash /n/run.sh dialog yes no && bash /n/run.sh dialog yes yes && bash /n/run.sh dialog no no && "
+                        "bash /n/run.sh answers yes no && bash /n/run.sh answers yes yes && "
+                        "bash /n/run.sh answers yes default && bash /n/run.sh answers no no && "
+                        "bash /n/run.sh answers default no && (bash /n/run.sh answers no yes || true) && "
                         "sh -c '. /n/lacks.sh; echo DIALOG=$(nos_lacks dialog 0); "
                         "echo PANEL=$(nos_lacks disk 1); echo PLAIN=$(nos_lacks disk 0)'"],
                        capture_output=True, text=True, timeout=600)
     got = [line for line in p.stdout.splitlines() if line.startswith("INSTALL ")]
     plain = "INSTALL disk /dev/test --root-size 10G --wipe --dhcp"
     enabled = plain + " --panel"
-    check("the dialog's Yes and panel=yes pass --panel",
-          p.returncode == 0 and len(got) == 5 and got[0] == enabled and got[2] == enabled,
+    with_nbs = enabled + " --nbs --nbs-host node1"
+    check("the dialog's panel Yes and panel=yes pass --panel",
+          p.returncode == 0 and len(got) == 8 and got[0] == enabled and got[3] == enabled,
           "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
-    check("the dialog's No, panel=no and no answer leave --panel out",
-          p.returncode == 0 and len(got) == 5 and got[1] == plain and got[3] == plain and got[4] == plain,
+    check("NBS Yes in the dialog and nbs=yes in answers add --nbs with the host's name",
+          p.returncode == 0 and len(got) == 8 and got[1] == with_nbs and got[4] == with_nbs,
           "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
+    check("nbs=yes without nbs_host uses the Linux hostname, sanitized",
+          p.returncode == 0 and len(got) == 8 and got[5] == enabled + " --nbs --nbs-host rescue-node",
+          "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
+    check("the dialog's No, panel=no and no answer leave both options out",
+          p.returncode == 0 and len(got) == 8 and got[2] == plain and got[6] == plain and got[7] == plain,
+          "rc %d, %r%s" % (p.returncode, got, p.stderr[-500:]))
+    check("nbs=yes without panel=yes is refused before an install runs",
+          p.returncode == 0 and "FAILED: nbs=yes needs panel=yes" in p.stdout and len(got) == 8,
+          "rc %d, %r%s" % (p.returncode, p.stdout[-1000:], p.stderr[-500:]))
 
     def lacked(kind):
         prefix = kind + "="

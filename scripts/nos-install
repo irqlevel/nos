@@ -61,6 +61,14 @@
 #                         (docs/api.md). /etc/rc is given its lines
 #   --no-panel            /etc/rc without `api panel create`: the panel's VM
 #                         is neither made nor started at boot
+#   --nbs                 NBS prepared on every boot: ipcnet, the cluster
+#                         registry and both NBS modules. No cluster is made and
+#                         no device added: do that in the panel after the hosts
+#                         have joined; volumes take three hosts (docs/nbs.md)
+#   --nbs-host NAME       this host's name in the cluster: lowercase letters,
+#                         digits and -, up to 63 (this Linux's hostname,
+#                         sanitized, unless given). Only with --nbs
+#   --no-nbs              /etc/rc without NBS's lines; /etc/ipc is kept
 #   --boot-once           boot nos once, the next time
 #   --reboot              and reboot now
 #
@@ -165,6 +173,16 @@ PANEL_RC=(
 # hands the panel (panel/src/lib/auth.ts checks it), N=2^15, r=8, p=1
 PANEL_PASS=etc/api/panel.pass
 PANEL_PORT=39233
+# NBS's lines of /etc/rc (--nbs): every host prepared alike. hosts.toml has
+# this host's identity already, so nothing here is a one-shot init. Creating
+# or joining the registry and NBS clusters, and adding devices, is the panel's.
+NBS_RC=(
+    "insmod /lib/modules/ipcnet.ko"
+    "ipcnet start"
+    "insmod /lib/modules/cluster.ko"
+    "insmod /lib/modules/nbs-mds.ko"
+    "insmod /lib/modules/nbs-cs.ko"
+)
 # A disk of nos's own (disk): GPT's partition types
 GPT_BIOS_BOOT=21686148-6449-6E6F-744E-656564454649
 GPT_ESP=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
@@ -909,6 +927,25 @@ compose_network() {
     fi
 }
 
+nbs_host_default() {
+    local name
+    name=$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9-]+/-/g' | cut -c1-63)
+    name=${name#-}
+    name=${name%-}
+    [ -n "$name" ] || name=node
+    printf '%s\n' "$name"
+}
+
+compose_nbs() {
+    if [ -n "$NBS_HOST" ] && [ "$NBS" != 1 ]; then
+        die "--nbs-host goes with --nbs"
+    fi
+    [ "$NBS" = 1 ] || return 0
+    [ -n "$NBS_HOST" ] || NBS_HOST=$(nbs_host_default)
+    [[ "$NBS_HOST" =~ ^[a-z0-9-]{1,63}$ ]] ||
+        die "--nbs-host: $NBS_HOST is not lowercase letters, digits and -, up to 63 characters"
+}
+
 # What the settings in NET_* come to, said
 net_said() {
     case "$NET_MODE" in
@@ -1195,6 +1232,7 @@ put_system() {
 
     put_ucode "$mnt"
     put_seed "$mnt"
+    put_nbs "$mnt"
     put_panel "$mnt"
 
     # The grubenv: what this machine boots nos with, and the one-shot flag
@@ -1246,6 +1284,65 @@ put_panel() {
                 mv -T "$rc.new" "$rc"
                 say "/etc/rc: api panel create taken out -- the panel's VM is left as it is"
             fi ;;
+    esac
+}
+
+nbs_nic() {
+    local mnt=$1 nic=eth0 configured
+    if [ "$NET_MODE" = multi ]; then
+        nic=$NET_DEFAULT
+    elif [ "$SET_NETWORK" = 0 ] && [ -f "$mnt/$NET_TOML" ]; then
+        configured=$(sed -n 's/^[[:space:]]*default[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' \
+            "$mnt/$NET_TOML" | head -n 1)
+        [ -z "$configured" ] || nic=$configured
+    fi
+    [[ "$nic" =~ ^eth[0-9]+$ ]] || die "NBS's interface $nic is not an ethN from $NET_TOML_PATH"
+    printf '%s\n' "$nic"
+}
+
+# NBS prepared (--nbs), or its boot lines taken out (--no-nbs). The host's
+# identity, registry and NBS state are the machine's: no cluster is made or
+# joined here, and no storage device is formatted or added.
+put_nbs() {
+    local mnt=$1 rc=$1/etc/rc line file nic cluster
+    case "$NBS" in
+        1)
+            nic=$(nbs_nic "$mnt")
+            file=$mnt/etc/ipc/hosts.toml
+            if [ -e "$file" ]; then
+                say "/etc/ipc/hosts.toml kept as it is"
+            else
+                mkdir -p "$mnt/etc/ipc"
+                cluster=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+                [ "${#cluster}" = 32 ] || die "could not make ipcnet's cluster id"
+                {
+                    echo "# ipcnet's identity, made by nos-install --nbs; cluster init/invite/join is done in the panel"
+                    printf 'name = "%s"\n' "$NBS_HOST"
+                    printf 'cluster = "%s"\n' "$cluster"
+                    printf 'nic = "%s"\n' "$nic"
+                    echo "peers = []"
+                } > "$file.new"
+                sync -f "$mnt/etc/ipc"
+                mv -T "$file.new" "$file"
+                say "/etc/ipc/hosts.toml: $NBS_HOST on $nic, a fresh cluster id, no peers yet"
+            fi
+            for line in "${NBS_RC[@]}"; do
+                grep -qxF -- "$line" "$rc" && continue
+                if [ -s "$rc" ] && [ -n "$(tail -c 1 "$rc")" ]; then
+                    echo >> "$rc"
+                fi
+                echo "$line" >> "$rc"
+                say "/etc/rc: $line"
+            done
+            say "NBS prepared, not initialized: in the panel, Cluster init/invite/join, then Block storage init, add host and add device; volumes take three hosts" ;;
+        0)
+            for line in "${NBS_RC[@]}"; do
+                if grep -qxF -- "$line" "$rc"; then
+                    grep -vxF -- "$line" "$rc" > "$rc.new" || true
+                    mv -T "$rc.new" "$rc"
+                    say "/etc/rc: $line taken out -- /etc/ipc and NBS's state are left as they are"
+                fi
+            done ;;
     esac
 }
 
@@ -1998,6 +2095,9 @@ BOOT_ONCE=0
 REBOOT=0
 # --panel 1, --no-panel 0, neither: /etc/rc as it is
 PANEL=
+# --nbs 1, --no-nbs 0, neither: /etc/rc and /etc/ipc as they are
+NBS=
+NBS_HOST=
 # The options given, for the commands that take few of them
 SEEN=
 
@@ -2033,6 +2133,10 @@ parse_options() {
             --cmdline=*) EXTRA=${1#*=}; SET_CMDLINE=1 ;;
             --panel) PANEL=1 ;;
             --no-panel) PANEL=0 ;;
+            --nbs) NBS=1 ;;
+            --no-nbs) NBS=0 ;;
+            --nbs-host) [ $# -ge 2 ] || usage; NBS_HOST=$2; shift ;;
+            --nbs-host=*) NBS_HOST=${1#*=} ;;
             --boot-once) BOOT_ONCE=1 ;;
             --reboot) BOOT_ONCE=1; REBOOT=1 ;;
             --root-size) [ $# -ge 2 ] || usage; ROOT_SIZE=$2; shift ;;
@@ -2083,6 +2187,7 @@ cmd_install() {
     resolve_partition
     compose_cmdline
     compose_network
+    compose_nbs
     open_image
     check_partition "$PART"
     check_hardware "$PART"
@@ -2312,6 +2417,7 @@ cmd_disk() {
     root=$(parse_root_size "$ROOT_SIZE")
     compose_cmdline
     compose_network
+    compose_nbs
     open_image
     check_disk "$DISK"
     check_hardware "$DISK" disk
@@ -2327,6 +2433,7 @@ cmd_disk() {
         say "$DISK${ids:+ ($ids)}, $(lsblk -dno SIZE "$DISK" | tr -d ' '): would be given a GPT of nos's own --"
         printf '%s' "$DISK_PLAN" | sed 's/^/nos-install: /'
         say "nos's network, $NET_TOML_PATH: $( [ "$SET_NETWORK" = 1 ] && net_said || echo DHCP )"
+        [ "$NBS" != 1 ] || say "NBS prepared as $NBS_HOST, with no cluster made and no device added"
         say "$(describe "$IMG/VERSION") on its root, and GRUB for$([ "$GRUB_BIOS" = 0 ] || echo " BIOS")$([ "$GRUB_BIOS" = 0 ] || [ "$GRUB_EFI" = 0 ] || echo " and")$([ "$GRUB_EFI" = 0 ] || echo " UEFI")"
         if [ "$FIRMWARE" = uefi ] && [ "$KEEP_BOOT_ORDER" = 0 ]; then
             say "and the firmware's boot entry for it put first after the network's"
@@ -2399,11 +2506,11 @@ parse_options "$@"
 case "$COMMAND" in
     install|update)
         only_options --image --format --ssh-key --udpshell --netconsole --cmdline --network-here --ip --gw \
-            --dns --dhcp --panel --no-panel --boot-once --reboot
+            --dns --dhcp --panel --no-panel --nbs --nbs-host --no-nbs --boot-once --reboot
         cmd_install "$COMMAND" ;;
     disk)
         only_options --image --ssh-key --udpshell --netconsole --cmdline --network-here --ip --gw --dns \
-            --dhcp --panel --no-panel --root-size --wipe --dry-run --keep-boot-order --reboot
+            --dhcp --panel --no-panel --nbs --nbs-host --no-nbs --root-size --wipe --dry-run --keep-boot-order --reboot
         cmd_disk ;;
     disks)
         only_options

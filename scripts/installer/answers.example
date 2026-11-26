@@ -18,6 +18,16 @@ root_size=10G
 # browser at https://<server>:39233. Left out, no panel is installed.
 #panel=yes
 
+# NBS prepared alongside the panel: ipcnet, the cluster registry and both NBS
+# modules start at every boot. This creates no cluster and adds no device.
+# After every host is installed alike, use the panel's Cluster init/invite/join,
+# then Block storage init/add host/add device. Volumes take three hosts.
+# nbs=yes takes panel=yes too. nbs_host is this host's unique name in the
+# cluster: lowercase letters, digits and -, up to 63; left out, the Linux
+# hostname, sanitized.
+#nbs=yes
+#nbs_host=node1
+
 # The keys nos's sshd lets in: ssh-ed25519 only. As many key= lines as you
 # like, and key_url= lines that give such keys (a GitHub user's .keys).
 key=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExam you@laptop
