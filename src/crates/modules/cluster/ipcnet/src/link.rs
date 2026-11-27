@@ -654,17 +654,17 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
                 Flush::Done | Flush::More => {}
             }
         }
-        /* More to go, and TCP took all of it: no wait for what comes in.
-         * The socket is woken first, so that the read below comes back at
-         * once when nothing is there -- with what is, when something is --
-         * and the next turn puts the next frames in. Without it a turn put
-         * MAX_PENDING in, TCP sent it in a few hundred microseconds, and
-         * the read then waited out its millisecond for data that was not
-         * coming: 64 KiB a turn of 2.4 ms, some 27 MB/s a connection
-         * whatever the link -- the same between two VMs on one bridge as
-         * across 1 GbE (N11). Waking its own socket costs the router's
-         * next wake nothing: the loop is on its way to the queues. */
-        if capped && sess.pending() == 0 {
+        /* More to go: no wait for what comes in. The socket is woken first,
+         * so that the read below comes back at once when nothing is there --
+         * with what is, when something is -- and the next turn puts the next
+         * frames in. Without it a turn put MAX_PENDING in, TCP sent it in a
+         * few hundred microseconds, and the read then waited out its
+         * millisecond for data that was not coming: 64 KiB a turn of 2.4 ms,
+         * some 27 MB/s a connection whatever the link -- the same between two
+         * VMs on one bridge as across 1 GbE (N11). Waking its own socket costs
+         * the router's next wake nothing: the loop is on its way to the
+         * queues. */
+        if capped {
             waker.wake();
         }
         /* In: what came -- for a millisecond while things go out, and while
