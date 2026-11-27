@@ -105,11 +105,11 @@ impl World {
         let high_base = 0x1_0000_0000;
         let mut ram = vec![(0, low)];
         let mut log = Log::new();
-        assert!(log.add(0, low * PAGE));
         if high != 0 {
             ram.push((high_base, high));
             assert!(log.add(high_base, high * PAGE));
         }
+        assert!(log.add(0, low * PAGE));
         let pages: Vec<u64> = ram.iter().flat_map(|&(b, n)| (0..n).map(move |k| b + k * PAGE)).collect();
         let n = pages.len();
         let cpus = (0..1 + r.below(4)).map(|_| Cpu { tlb: BTreeSet::new(), took: 1 }).collect();
@@ -219,6 +219,7 @@ impl World {
                     self.round += 1;
                     let n = self.log.take(Some(&mut self.table), &mut |gpa| taken.push(gpa));
                     invariant!(n == Some(taken.len() as u64), "a round's count is not its pages");
+                    invariant!(taken.windows(2).all(|w| w[0] < w[1]), "a round's pages not in address order");
                     invariant!(taken.iter().all(|p| self.table.ro.contains(p)), "a round's page writable after it");
                     let need = self.narrow();
                     self.queue = taken.into_iter().collect();
@@ -248,7 +249,10 @@ fn pieces(r: &mut Input) {
     let base = 0x1_0000_0000u64;
     let mut log = Log::new();
     assert!(log.add(base, pages * PAGE));
+    assert!(log.add(0, PAGE));
     let mut want = BTreeSet::new();
+    log.wrote(0, PAGE);
+    want.insert(0);
     while let Some(op) = r.op(3) {
         let page = match op {
             0 => {

@@ -1874,6 +1874,7 @@ TLB holds, or walking the table and faulting on a page read-only, dropping
 its TLB as it takes the table's new identity -- the host's writes beside
 them, and the rounds' copies read a page at a time as the writes go on: once
 paused and the last round copied, the copy is the memory, page for page;
+regions added out of address order, every take still lowest address first;
 the log over, no page read-only (a fault that does not mark, a round that
 does not protect again, a host's write unmarked: each caught within three
 inputs). And the network that goes with it (M3), in the network's targets:
