@@ -251,9 +251,11 @@ hands back what peers say.
   counted, when the sender has no room: a bounce keeps no place, as a Down
   does. A send to another host is `Ok` once it is in the router's mailbox,
   so a bounce is the only word there is of one that went nowhere.
-- **Two classes**: a tag with the bit `TAG_BULK` (0x4000_0000) goes between
-  hosts by the bulk connection, any other by the control one, so that a
-  megabyte of data never stands in front of a heartbeat. Order between two
+- **Two classes for ordinary IPC, and NBS's own**: a tag with the bit
+  `TAG_BULK` (0x4000_0000) goes between hosts by the bulk connection, any
+  other by the control one, so that a megabyte of data never stands in front
+  of a heartbeat. NBS's request and answer tags go by its data connection
+  when both hosts have it, otherwise by bulk as before. Order between two
   mailboxes holds within a class, not across them -- nor between a bulk
   message and the Down of its sender, which comes by the control one.
 - **Hosts coming and going** are told to the watchers of `host.`
@@ -282,14 +284,18 @@ fail the gate.
 
 `ipcwire` (`src/crates/common/ipc/ipcwire`, no kernel and no `unsafe`) is what ipcnet
 says to another host inside their TLS session (plans/ipc.md, I4): frames of
-an 8-byte head -- kind, flags, two bytes kept at zero, a length -- and at
-most 16 KiB, a TLS record's worth. `Hello` first, both ways (the version,
-the cluster's id, the session -- the dialing host's number for the pair of
-connections, which the other pairs them by -- both hosts' names); `Ping`
+an 8-byte head -- kind, flags, two bytes kept at zero, a length. Ordinary
+frames are at most 16 KiB, a TLS record's worth. `Hello` first, both ways
+(the version, the cluster's id, the session -- the dialing host's number
+shared by its connections, which the other pairs them by -- both hosts'
+names); `Ping`
 and `Pong`; a message as a `Head` (its number on the connection, where it
 goes -- an address or a name -- who sent it, its tag, reference and length,
-up to 1 MiB) and `Body` frames, other messages' frames between them;
-`Bounced`, `Monitor`, `Demonitor`, `Down`. `decode` gives a frame once all
+up to 1 MiB) and `Body` frames, other messages' frames between them. On
+NBS's own link a message of at most 384 KiB can instead be one `Whole` frame,
+written from the message's pieces and delivered without the assembler;
+larger ones keep their `Head`/`Body` path on that same link. `Bounced`,
+`Monitor`, `Demonitor`, `Down`. `decode` gives a frame once all
 of it has come, every length checked first -- a head claiming more than a
 frame is refused at once, not waited on -- and a frame it gives encodes to
 exactly the bytes it came from. `Assembler` puts messages back together,
@@ -330,8 +336,9 @@ hosts and back.
   rekey`), the server and every peer's clients made anew with it and the
   connections up kept. It answers while the module is loaded, serving or
   not (docs/cluster.md).
-- **Two TCP connections a peer**, control and bulk, on the host's one port
-  -- 39240 unless hosts.toml's `port` says another -- on the interface
+- **Up to three TCP connections a peer**: control, bulk and NBS's data link,
+  on the host's one port -- 39240 unless hosts.toml's `port` says another --
+  on the interface
   hosts.toml names (eth0 unless told; never hv0, so that no guest reaches
   it). A peer is called at the port its address says, `<ip>:<port>` in
   hosts.toml and in the registry, and at 39240 where it says none: two
@@ -348,29 +355,36 @@ hosts and back.
 - **TLS 1.3, both keys pinned**: the dialer is a `tls::pinned::Client` of
   the peer's keys, the listener a `Server` of every peer's, ChaCha20-
   Poly1305 asked for first (measured: docs/tls.md). The connection's class is
-  its ALPN, `nos-ipc/1` or `nos-ipc-bulk/1`. Then the `Hello` each way: the
+  its ALPN, `nos-ipc/1`, `nos-ipc-bulk/1` or `nos-nbs/1`. Then the `Hello`
+  each way: the
   cluster's id, the session, both names -- the name the dialer says has to
   be the one its key is pinned under, its address that peer's.
 - **Who dials**: of two names, the one that sorts first, a session at a
-  time: the control connection, and once it has said its Hello the bulk one;
-  the other end pairs them by the session's number, a new session ending its
-  old. The peer is up -- the channel's `peer_up` -- once both have said
-  their Hello, and lost the moment either ends, a frame the wire refuses
-  comes, or nothing is heard for 3 s (a `Ping` goes every 500 ms each way):
+  time: control, bulk and NBS's data connection. The other end pairs them by
+  the session's number, a new session ending its old. The peer comes up once
+  control and bulk have said their Hello; the optional data connection starts
+  after that, so it cannot race their attach. The first NBS message chooses
+  `nbs data` if that link is already attached,
+  or `nbs bulk` otherwise -- as happens with an older peer. That choice holds
+  for the session, so NBS messages never change class midway. The peer is lost the
+  moment an established connection ends, a frame the wire refuses comes, or
+  nothing is heard for 3 s (a `Ping` goes every 500 ms each way):
   what was queued for it and never went is bounced (`Unsent`), the channel
   told (HostLost to every monitor of an address there), and the monitors it
   had this host hold taken back. The dialer tries again after a wait that
   doubles from 250 ms to 8 s while no session comes up.
 - **Out**: the router's task takes each message from its mailbox into the
   peer's queue of its class, at most a megabyte (control) or four
-  (bulk) waiting -- past that, bounced. A connection's task sends small
-  frames first, then messages a frame at a time, up to eight begun at once
-  and in turn -- but never two of one pair, sender and destination, since
-  the other end hands a message over as its last frame comes and a pair is
-  promised its order. In: frames decoded as they come, a message handed to
-  the channel the moment it is whole (`deliver_remote`), a full mailbox a
-  `Bounced` back, never a connection that stops reading; what a peer may not
-  reach here is dropped and counted.
+  (bulk, NBS data) waiting -- past that, bounced. A connection's task sends
+  small frames first, then messages a frame at a time, up to eight begun at
+  once and in turn -- but never two of one pair, sender and destination,
+  since the other end hands a message over as its last frame comes and a
+  pair is promised its order. NBS's link carries a message whole where it
+  fits, larger ones through the same ordered Head/Body path. In: frames
+  decoded as they come, a message handed to the channel the moment it is
+  whole (`deliver_remote`), a full mailbox a `Bounced` back, never a
+  connection that stops reading; what a peer may not reach here is dropped
+  and counted.
 - **One wait for both ways**: a connection's task sleeps in its socket's
   receive, which TCP wakes the moment data comes -- its receive waits on an
   event of the connection's, which the receive path signals -- and which

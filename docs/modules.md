@@ -809,7 +809,7 @@ $ ipcnet add b 10.9.0.2 9c1e...              # a peer, by its key
 $ ipcnet start
 $ ipcnet
 ipcnet: a in cluster 0123..., on eth0 port 39240, key 5f3a... -- serving 12 s
-  b            10.9.0.2        dials -- up 10 s as host 65; sent 200 got 200, ...
+  b            10.9.0.2        dials -- up 10 s as host 65, nbs data; sent 200 got 200, ...
 $ ipc ping kernel.echo@b count=100
 ```
 

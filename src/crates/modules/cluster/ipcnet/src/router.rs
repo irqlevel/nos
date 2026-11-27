@@ -2,9 +2,10 @@
 //! (docs/ipc.md, "Between hosts: the router"), and the task that takes it.
 //!
 //! A message for a peer -- `TAG_ROUTE`, its payload the route head and then
-//! the message's own bytes -- goes into the peer's queue of its class, bulk
-//! for a tag with TAG_BULK and control for any other, and is bounced back
-//! to its sender (`Unsent`) when the peer is not up any more or its queue
+//! the message's own bytes -- goes into the peer's queue of its class: NBS's
+//! data link for its request and answer tags where that link is up, bulk for
+//! any other tag with TAG_BULK and control for one without it. It is bounced
+//! back to its sender (`Unsent`) when the peer is not up any more or its queue
 //! is full: what waits to go to a host has its cap, and a sender hears when
 //! it was met. A monitor of a mailbox there is asked of the peer -- a
 //! `Monitor` frame -- and a Down of a monitor this host's router holds for
@@ -71,7 +72,15 @@ fn route(shared: &Shared, m: Pieces) {
                 To::Name(n) => Dest::Name(n.to_vec()),
             };
             let (tag, reference, peer_number) = (head.tag, head.reference, head.peer);
-            let class = if tag & TAG_BULK != 0 { BULK } else { CONTROL };
+            let kind = tag & !TAG_BULK;
+            let nbs = tag & TAG_BULK != 0 && (kind == nbswire::TAG_REQUEST || kind == nbswire::TAG_ANSWER);
+            let class = if nbs {
+                peer.as_ref().map_or(BULK, |p| p.nbs_class())
+            } else if tag & TAG_BULK != 0 {
+                BULK
+            } else {
+                CONTROL
+            };
             let len = m.len.saturating_sub(route::HEAD);
             let msg = OutMsg { from: m.from.0, to, tag, reference, pieces: m.pieces, skip: route::HEAD, len };
             let left = match &peer {
@@ -91,13 +100,13 @@ fn route(shared: &Shared, m: Pieces) {
             match left {
                 /* Its connection's task told, out of the lock */
                 Ok((waker, queue)) => {
-                    records::queued(peer_number, class == BULK, reference, len, queue);
+                    records::queued(peer_number, class != CONTROL, reference, len, queue);
                     if let Some(w) = waker {
                         w.wake();
                     }
                 }
                 Err((msg, why, queue)) => {
-                    records::bounced(peer_number, class == BULK, reference, len, queue, why);
+                    records::bounced(peer_number, class != CONTROL, reference, len, queue, why);
                     unsent(shared, peer.as_deref(), peer_number, &msg)
                 }
             }

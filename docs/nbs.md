@@ -987,11 +987,15 @@ epoch since, the cs made the set's joiner meanwhile, is kept. And sooner
 than 30 s once a write was refused for want of room: the room of a replica
 taken out came back to it only that way.
 
-A client's requests and their answers go between hosts by ipcnet's bulk
-connection, all of them, so that they keep their order and their data do not
-hold up raft's messages. A request carries 256 KiB at most. One to a host
-with no cs -- nbs-cs not loaded there -- comes back from the channel as a
-bounce, and the client takes the cs for one that does not answer.
+A client's requests and their answers go between hosts by ipcnet's own NBS
+data connection when both ends offer it, or by bulk with an older peer. The
+mode is chosen for the whole session, so requests keep their order and their
+data do not hold up raft's messages. On the data connection a request of at
+most 384 KiB travels as one frame, without 16-KiB fragmentation and
+reassembly; larger messages keep the ordinary framed path. A request
+carries 256 KiB at most. One to a host with no cs -- nbs-cs not loaded there
+-- comes back from the channel as a bounce, and the client takes the cs for
+one that does not answer.
 
 ## The client
 

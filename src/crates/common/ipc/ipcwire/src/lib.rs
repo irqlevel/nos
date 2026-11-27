@@ -6,18 +6,20 @@
 //! put back together.
 //!
 //! A frame is an 8-byte head -- its kind, flags (none yet: zero), two bytes
-//! kept at zero, the length of what follows -- and at most [`FRAME_MAX`] in
-//! all: a TLS record's worth, so that a megabyte is cut up and other
-//! messages' frames go between its pieces. Numbers are big-endian.
+//! kept at zero, the length of what follows. An ordinary frame is at most
+//! [`FRAME_MAX`], a TLS record's worth, so that a megabyte is cut up and
+//! other messages' frames go between its pieces. On NBS's own link, a
+//! message of at most [`WHOLE_MAX`] can instead be one `Whole` frame.
+//! Numbers are big-endian.
 //!
 //! [`decode`] takes the bytes as they come and gives a frame once all of it
 //! is there, every length checked before anything is kept; whatever it
 //! refuses, the connection ends with. [`Assembler`] puts messages back
 //! together from their `Head` and `Body` frames: a bounded number at once and
 //! a bounded number of bytes, each body kept in pieces of a frame -- no
-//! allocation larger than [`PAYLOAD_MAX`], whatever a message's size. Nothing
-//! here trusts the other end: what it says is a host's, but a host can be
-//! wrong, and a peer's mistake must cost a connection, not the kernel.
+//! allocation larger than [`PAYLOAD_MAX`], whatever a split message's size.
+//! Nothing here trusts the other end: what it says is a host's, but a host
+//! can be wrong, and a peer's mistake must cost a connection, not the kernel.
 
 extern crate alloc;
 
@@ -37,6 +39,10 @@ pub const PAYLOAD_MAX: usize = FRAME_MAX - HEAD;
 pub const BODY_MAX: usize = PAYLOAD_MAX - 4;
 /// A message's bytes at most: the channel's own limit.
 pub const MESSAGE_MAX: usize = 1 << 20;
+/// An NBS message carried whole, without Head/Body fragmentation.
+pub const WHOLE_MAX: usize = 384 * 1024;
+/// The most metadata before its bytes: a name address, sender, tag and reference.
+pub const WHOLE_META_MAX: usize = 1 + 1 + NAME_MAX + 8 + 4 + 8;
 /// A mailbox's name at most, as the channel has it.
 pub const NAME_MAX: usize = 48;
 /// A host's name at most: a DNS label's.
@@ -59,6 +65,7 @@ pub enum Kind {
     Monitor = 7,
     Demonitor = 8,
     Down = 9,
+    Whole = 10,
 }
 
 impl Kind {
@@ -73,6 +80,7 @@ impl Kind {
             7 => Kind::Monitor,
             8 => Kind::Demonitor,
             9 => Kind::Down,
+            10 => Kind::Whole,
             _ => return None,
         })
     }
@@ -90,9 +98,9 @@ pub enum To<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
     /// The first frame each way: the version, the cluster both say they
-    /// are in, the session -- the dialing host's number for the pair of
-    /// connections this is one of, which the other end pairs them by and
-    /// says back -- the sender's name and the name it called the other by.
+    /// are in, the session -- the dialing host's number shared by its
+    /// connections, which the other end pairs them by and says back -- the
+    /// sender's name and the name it called the other by.
     Hello { version: u16, cluster: [u8; 16], session: u64, from: &'a [u8], to: &'a [u8] },
     Ping { seq: u64 },
     Pong { seq: u64 },
@@ -102,6 +110,8 @@ pub enum Frame<'a> {
     Head { msg: u32, to: To<'a>, from: u64, tag: u32, reference: u64, len: u32 },
     /// The next of a message's bytes.
     Body { msg: u32, data: &'a [u8] },
+    /// An NBS message, whole in this one frame.
+    Whole { to: To<'a>, from: u64, tag: u32, reference: u64, data: &'a [u8] },
     /// A message the receiving host could not deliver -- its mailbox full,
     /// or gone -- told back to its sender.
     Bounced { from: u64, to: To<'a>, tag: u32, reference: u64, why: u8 },
@@ -224,7 +234,8 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Frame<'_>, usize)>, Error> {
         return Err(Error::Kind);
     }
     let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    if len > PAYLOAD_MAX {
+    let most = if kind == Kind::Whole { WHOLE_MAX + WHOLE_META_MAX } else { PAYLOAD_MAX };
+    if len > most {
         return Err(Error::Length);
     }
     if buf.len() < HEAD + len {
@@ -266,6 +277,15 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Frame<'_>, usize)>, Error> {
                 return Err(Error::Length);
             }
             Frame::Body { msg, data }
+        }
+        Kind::Whole => {
+            let to = r.to()?;
+            let from = r.u64()?;
+            let tag = r.u32()?;
+            let reference = r.u64()?;
+            let data = r.buf;
+            r.buf = &[];
+            Frame::Whole { to, from, tag, reference, data }
         }
         Kind::Bounced => {
             let from = r.u64()?;
@@ -346,6 +366,15 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
             }
             (Kind::Body, 4 + data.len())
         }
+        Frame::Whole { to, data, .. } => {
+            if !to_ok(to) {
+                return Err(Error::Name);
+            }
+            if data.len() > WHOLE_MAX {
+                return Err(Error::Length);
+            }
+            (Kind::Whole, to_len(to) + 8 + 4 + 8 + data.len())
+        }
         Frame::Bounced { to, .. } => {
             if !to_ok(to) {
                 return Err(Error::Name);
@@ -356,7 +385,7 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
         Frame::Demonitor { .. } => (Kind::Demonitor, 8),
         Frame::Down { .. } => (Kind::Down, 9),
     };
-    debug_assert!(len <= PAYLOAD_MAX);
+    debug_assert!(len <= PAYLOAD_MAX || kind == Kind::Whole);
     out.reserve_exact(HEAD + len);
     let start = out.len();
     out.extend_from_slice(&[kind as u8, 0, 0, 0]);
@@ -383,6 +412,13 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
             w.bytes(&msg.to_be_bytes());
             w.bytes(data);
         }
+        Frame::Whole { to, from, tag, reference, data } => {
+            w.to(to);
+            w.bytes(&from.to_be_bytes());
+            w.bytes(&tag.to_be_bytes());
+            w.bytes(&reference.to_be_bytes());
+            w.bytes(data);
+        }
         Frame::Bounced { from, to, tag, reference, why } => {
             w.bytes(&from.to_be_bytes());
             w.to(to);
@@ -401,6 +437,35 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
         }
     }
     debug_assert_eq!(out.len() - start, HEAD + len);
+    Ok(())
+}
+
+/// A whole NBS message, written from its pieces without joining them first.
+pub fn encode_whole(to: To<'_>, from: u64, tag: u32, reference: u64, pieces: &[&[u8]], out: &mut Vec<u8>)
+                    -> Result<(), Error> {
+    if let To::Name(n) = to {
+        if !is_name(n) {
+            return Err(Error::Name);
+        }
+    }
+    let data_len = pieces.iter().try_fold(0usize, |n, p| n.checked_add(p.len())).ok_or(Error::Length)?;
+    if data_len > WHOLE_MAX {
+        return Err(Error::Length);
+    }
+    let len = to_len(&to) + 8 + 4 + 8 + data_len;
+    out.reserve_exact(HEAD + len);
+    let start = out.len();
+    out.extend_from_slice(&[Kind::Whole as u8, 0, 0, 0]);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    let mut w = Writer { out };
+    w.to(&to);
+    w.bytes(&from.to_be_bytes());
+    w.bytes(&tag.to_be_bytes());
+    w.bytes(&reference.to_be_bytes());
+    for p in pieces {
+        w.bytes(p);
+    }
+    debug_assert_eq!(w.out.len() - start, HEAD + len);
     Ok(())
 }
 

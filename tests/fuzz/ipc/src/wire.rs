@@ -24,7 +24,7 @@ const HOSTS: [&[u8]; 5] = [b"ex44", b"ax41", b"a-b-1", b"Ex44", b""];
 
 fn frame<'a>(r: &mut Input, data: &'a [u8]) -> Frame<'a> {
     let to = |r: &mut Input| if r.bool() { To::Addr(r.u64()) } else { To::Name(r.pick(&NAMES)) };
-    match r.u8() % 9 {
+    match r.u8() % 10 {
         0 => {
             let mut cluster = [0u8; 16];
             cluster.copy_from_slice(&r.bytes(16)[..16]);
@@ -38,9 +38,10 @@ fn frame<'a>(r: &mut Input, data: &'a [u8]) -> Frame<'a> {
                           len: r.pick(&[0u32, 1, 4096, MESSAGE_MAX as u32, MESSAGE_MAX as u32 + 1, any]) }
         }
         4 => Frame::Body { msg: r.u32(), data },
-        5 => Frame::Bounced { from: r.u64(), to: to(r), tag: r.u32(), reference: r.u64(), why: r.u8() },
-        6 => Frame::Monitor { id: r.u64(), target: r.u64() },
-        7 => Frame::Demonitor { id: r.u64() },
+        5 => Frame::Whole { to: to(r), from: r.u64(), tag: r.u32(), reference: r.u64(), data },
+        6 => Frame::Bounced { from: r.u64(), to: to(r), tag: r.u32(), reference: r.u64(), why: r.u8() },
+        7 => Frame::Monitor { id: r.u64(), target: r.u64() },
+        8 => Frame::Demonitor { id: r.u64() },
         _ => Frame::Down { id: r.u64(), reason: r.u8() },
     }
 }
@@ -54,7 +55,7 @@ fn canonical(bytes: &[u8]) {
                 let mut again = Vec::new();
                 invariant!(encode(&f, &mut again).is_ok(), "a frame decoded that does not encode: {:?}", f);
                 invariant!(again[..] == bytes[at..at + n], "{:?} decoded from bytes it does not encode to", f);
-                invariant!(n <= FRAME_MAX, "a frame of {} bytes", n);
+                invariant!(n <= FRAME_MAX || matches!(f, Frame::Whole { .. }), "a frame of {} bytes", n);
                 reached("wire: a frame decoded from bytes of the input's");
                 at += n;
             }
@@ -65,7 +66,12 @@ fn canonical(bytes: &[u8]) {
                 let rest = &bytes[at..];
                 if rest.len() >= ipcwire::HEAD {
                     let len = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
-                    invariant!(len <= ipcwire::PAYLOAD_MAX, "a head claiming {} bytes is waited on, not refused", len);
+                    let most = if rest[0] == ipcwire::Kind::Whole as u8 {
+                        ipcwire::WHOLE_MAX + ipcwire::WHOLE_META_MAX
+                    } else {
+                        ipcwire::PAYLOAD_MAX
+                    };
+                    invariant!(len <= most, "a head claiming {} bytes is waited on, not refused", len);
                 }
                 return;
             }
@@ -153,6 +159,16 @@ pub fn run(r: &mut Input) {
         }
     }
     invariant!(buf.is_empty() && got == sent, "{} frames sent, {} came back as sent", sent.len(), got.len());
+
+    let parts: [&[u8]; 3] = [b"ab", b"", b"cdef"];
+    let mut whole = Vec::new();
+    ipcwire::encode_whole(To::Name(b"nbs.cs"), 7, 1, 9, &parts, &mut whole).expect("a whole message");
+    match decode(&whole) {
+        Ok(Some((Frame::Whole { to: To::Name(b"nbs.cs"), from: 7, tag: 1, reference: 9, data }, used))) => {
+            invariant!(used == whole.len() && data == b"abcdef", "whole pieces came back other than sent");
+        }
+        other => invariant!(false, "a whole message answered {:?}", other),
+    }
 
     assemble(r);
 }

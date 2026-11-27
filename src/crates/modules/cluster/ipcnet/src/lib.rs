@@ -13,17 +13,19 @@
 //!     ipcnet start
 //!     ipcnet                                 the peers, and what went between them
 //!
-//! Each pair of hosts has two TCP connections, control and bulk, both TLS
-//! 1.3 with both keys pinned, on one port (39240), on the interface
-//! hosts.toml names -- eth0 unless told, and never hv0, so no guest reaches
-//! it -- whose listener answers the peers' addresses alone. The host whose
-//! name sorts first dials. The module is the channel's router: everything
-//! sent to a peer's address comes to its mailbox, and it hands the channel
-//! what peers send (`deliver_remote`), which delivers only to a `Cluster`
-//! name or to a mailbox that has sent there. files.rs has its folder,
-//! server.rs its tasks, link.rs a connection, router.rs the router, and
-//! peer.rs a peer's session -- up once both connections have said their
-//! Hello, lost the moment either ends or is silent for three seconds.
+//! Each pair of hosts has control and bulk TCP connections, and an NBS-only
+//! data connection where both ends have it, all TLS 1.3 with both keys
+//! pinned, on one port (39240), on the interface hosts.toml names -- eth0
+//! unless told, and never hv0, so no guest reaches it -- whose listener
+//! answers the peers' addresses alone. The host whose name sorts first dials.
+//! The module is the channel's router: everything sent to a peer's address
+//! comes to its mailbox, and it hands the channel what peers send
+//! (`deliver_remote`), which delivers only to a `Cluster` name or to a
+//! mailbox that has sent there. files.rs has its folder, server.rs its
+//! tasks, link.rs a connection, router.rs the router, and peer.rs a peer's
+//! session -- up once control and bulk have said their Hello, lost when
+//! either ends or is silent for three seconds, and held to the same rule
+//! for NBS's data connection once that mode is chosen.
 
 extern crate alloc;
 
@@ -309,13 +311,20 @@ fn status(state: &State, out: &mut Output) -> Result<(), String> {
                      now.saturating_sub(sh.started_ns) / 1_000_000_000);
     let peers: Vec<Arc<peer::Peer>> = sh.peers.with(|v| v.clone());
     for p in &peers {
-        let (name, said, number, since) = peer::describe(p);
+        let (name, said, number, since, data_mode) = peer::describe(p);
         let c = &p.counts;
         let mut state = if number != 0 {
             alloc::format!("up {} s as host {}", now.saturating_sub(since) / 1_000_000_000, number)
         } else {
             alloc::format!("down: {}", said)
         };
+        if number != 0 {
+            state += match data_mode {
+                peer::DataMode::Direct => ", nbs data",
+                peer::DataMode::Bulk => ", nbs bulk",
+                peer::DataMode::Pending => "",
+            };
+        }
         p.live.with(|l| {
             if let Some(n) = &l.only {
                 let _ = write!(state, " (invited: {} alone)", n);

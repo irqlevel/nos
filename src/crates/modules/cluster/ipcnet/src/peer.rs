@@ -1,16 +1,16 @@
 //! A peer -- another host of the cluster -- as this host keeps it: the
-//! session its two connections are of, its number in the channel while it
-//! is up, what waits to go to it by class, and the monitors this host's
+//! session its connections are of, its number in the channel while it is
+//! up, what waits to go to it by class, and the monitors this host's
 //! router holds for it.
 //!
-//! A peer is up once both of a session's connections -- control and bulk --
-//! have said their `Hello`; it is lost the moment either of them ends, says
-//! nothing for LOST_MS, or a new session of it arrives, and only once a
-//! session: what was queued for it and never went is bounced back to its
-//! senders, the channel is told (every monitor of an address there gets
-//! HostLost), and the monitors it held here are taken back. Its locks are
-//! taken `st` before `out`, never the other way, and nothing is waited for
-//! under either.
+//! A peer is up once control and bulk have said their `Hello`; it is lost
+//! the moment either of them ends, says nothing for LOST_MS, or a new
+//! session of it arrives. NBS's data connection is held to the same rule
+//! once its mode is chosen. A session is lost only once: what was queued
+//! for it and never went is bounced back to its senders, the channel is
+//! told (every monitor of an address there gets HostLost), and the monitors
+//! it held here are taken back. Its locks are taken `st` before `out`,
+//! never the other way, and nothing is waited for under either.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -28,15 +28,23 @@ use tls::pinned::Fingerprint;
 
 /// The classes of what goes to a peer, each its own connection: control --
 /// Hello, heartbeats, monitors, Downs, bounces, and every message whose
-/// tag has not TAG_BULK -- and bulk.
+/// tag has not TAG_BULK -- bulk, and NBS's own data link.
 pub const CONTROL: usize = 0;
 pub const BULK: usize = 1;
-pub const CLASSES: usize = 2;
+pub const DATA: usize = 2;
+pub const CLASSES: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DataMode {
+    Pending,
+    Direct,
+    Bulk,
+}
 
 /// What may wait to go to a peer, by class, before the router bounces what
 /// comes for it (`Bounce::Unsent`): the bytes of messages not yet begun on
 /// their connection.
-pub const QUEUE_BYTES: [usize; CLASSES] = [1 << 20, 4 << 20];
+pub const QUEUE_BYTES: [usize; CLASSES] = [1 << 20, 4 << 20, 4 << 20];
 /// Frames of the control kind waiting at once: Pongs, Downs, bounces,
 /// monitors. Past it the newest is dropped and counted -- a bounce or a Pong
 /// is news, and what asked for a monitor's Down is told by HostLost should
@@ -99,6 +107,8 @@ pub struct State {
     pub session: u64,
     /// Which of the session's connections have said their Hello.
     pub attached: [bool; CLASSES],
+    /// How NBS messages go, once the peer is up.
+    pub data_mode: DataMode,
     /// Its number in the channel, while it is up: 0 otherwise.
     pub number: u16,
     pub up_since_ns: u64,
@@ -182,9 +192,9 @@ impl Peer {
             conf,
             live: Locked::new(live)?,
             dials,
-            st: Locked::new(State { session: 0, attached: [false; CLASSES], number: 0, up_since_ns: 0, said: "new",
-                                    monitors: Vec::new() })?,
-            out: [Locked::new(Out::new())?, Locked::new(Out::new())?],
+            st: Locked::new(State { session: 0, attached: [false; CLASSES], data_mode: DataMode::Pending, number: 0,
+                                    up_since_ns: 0, said: "new", monitors: Vec::new() })?,
+            out: [Locked::new(Out::new())?, Locked::new(Out::new())?, Locked::new(Out::new())?],
             number_now: AtomicU16::new(0),
             removed: AtomicBool::new(false),
             counts: Counts::default(),
@@ -228,6 +238,7 @@ impl Peer {
             }
             st.session = session;
             st.attached = [false; CLASSES];
+            st.data_mode = DataMode::Pending;
             st.said = "dialing";
             true
         })
@@ -243,9 +254,53 @@ impl Peer {
         self.st.with(|st| (st.session == session && st.number != 0).then_some(st.number))
     }
 
+    fn noted_up(&self) {
+        add(&self.counts.ups, 1);
+        kcore::klog!(0, "ipcnet: {} ({}) up", self.conf.name, super::files::Ip(self.conf.ip));
+        super::records::link(self.number_now.load(Ordering::Acquire), true, self.counts.ups.load(Ordering::Relaxed),
+                             self.counts.losses.load(Ordering::Relaxed));
+    }
+
+    /// Up once control and bulk are there. NBS's optional data connection
+    /// may arrive before or after that.
+    fn maybe_up(&self, router: &Mailbox, st: &mut State, lost: &mut Option<Lost>) -> Result<bool, Refusal> {
+        if st.number != 0 || !st.attached[CONTROL] || !st.attached[BULK] {
+            return Ok(false);
+        }
+        match router.peer_up(&self.conf.name) {
+            Ok(number) => {
+                st.number = number;
+                st.up_since_ns = kcore::time::boot_time_ns();
+                st.said = "up";
+                for o in &self.out {
+                    o.with(|o| o.number = number);
+                }
+                self.number_now.store(number, Ordering::Release);
+                Ok(true)
+            }
+            Err(_) => {
+                /* The channel would not have it -- stopping, its table
+                 * full: the session is over before it began */
+                *lost = Some(self.end(st, "refused by the channel"));
+                Ok(false)
+            }
+        }
+    }
+
+    /// The first NBS message fixes the mode for this session: the data link
+    /// if it is already there, bulk otherwise. Never switch midway.
+    pub fn nbs_class(&self) -> usize {
+        self.st.with(|st| {
+            if st.data_mode == DataMode::Pending {
+                st.data_mode = DataMode::Bulk;
+            }
+            if st.data_mode == DataMode::Direct { DATA } else { BULK }
+        })
+    }
+
     /// The connection of class `class` of `session` has said its Hello: let
     /// into the session -- which, accepted, may be a new one that ends the
-    /// peer's old -- and, the second of two, the peer is up.
+    /// peer's old -- and up once control and bulk are there.
     pub fn attach(&self, router: &Mailbox, class: usize, session: u64, accepted: bool) -> Result<(), Refusal> {
         let mut lost = None;
         let up = self.st.with(|st| {
@@ -260,42 +315,23 @@ impl Peer {
                 }
                 st.session = session;
                 st.attached = [false; CLASSES];
+                st.data_mode = DataMode::Pending;
                 st.said = "connecting";
             }
             if st.attached[class] {
                 return Err(Refusal::Twice);
             }
             st.attached[class] = true;
-            if !st.attached.iter().all(|&a| a) {
-                return Ok(false);
+            if class == DATA && st.data_mode == DataMode::Pending {
+                st.data_mode = DataMode::Direct;
             }
-            match router.peer_up(&self.conf.name) {
-                Ok(number) => {
-                    st.number = number;
-                    st.up_since_ns = kcore::time::boot_time_ns();
-                    st.said = "up";
-                    for o in &self.out {
-                        o.with(|o| o.number = number);
-                    }
-                    self.number_now.store(number, Ordering::Release);
-                    Ok(true)
-                }
-                Err(_) => {
-                    /* The channel would not have it -- stopping, its table
-                     * full: the session is over before it began */
-                    lost = Some(self.end(st, "refused by the channel"));
-                    Ok(false)
-                }
-            }
+            self.maybe_up(router, st, &mut lost)
         });
         if let Some(l) = lost {
             l.finish(router, self);
         }
         if up == Ok(true) {
-            add(&self.counts.ups, 1);
-            kcore::klog!(0, "ipcnet: {} ({}) up", self.conf.name, super::files::Ip(self.conf.ip));
-            super::records::link(self.number_now.load(Ordering::Acquire), true, self.counts.ups.load(Ordering::Relaxed),
-                                 self.counts.losses.load(Ordering::Relaxed));
+            self.noted_up();
         }
         up.map(|_| ())
     }
@@ -315,6 +351,7 @@ impl Peer {
         let was_up = st.number;
         st.session = 0;
         st.attached = [false; CLASSES];
+        st.data_mode = DataMode::Pending;
         st.number = 0;
         self.number_now.store(0, Ordering::Release);
         st.said = why;
@@ -373,7 +410,7 @@ impl Lost {
     }
 }
 
-/// A peer's name, as `ipcnet` lists it with its state.
-pub fn describe(p: &Peer) -> (String, &'static str, u16, u64) {
-    p.st.with(|st| (p.conf.name.clone(), st.said, st.number, st.up_since_ns))
+/// A peer's name, as `ipcnet` lists it with its state and NBS's data mode.
+pub fn describe(p: &Peer) -> (String, &'static str, u16, u64, DataMode) {
+    p.st.with(|st| (p.conf.name.clone(), st.said, st.number, st.up_since_ns, st.data_mode))
 }

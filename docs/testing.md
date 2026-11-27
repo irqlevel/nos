@@ -1125,9 +1125,10 @@ any two. `a` and `b` pin each other; `a` pins `c` by a key `c` does not have,
 and `c` holds `b`'s key, pinning `a`; `b` pins `a` alone. kernel.echo runs
 on each, a `Cluster` name, and `ipc ping` is what goes between them:
 
-- both up, said in the log; 200 small pings each way, eight in flight, and
-  sixteen of a megabyte by the bulk connection -- every answer the bytes
-  sent, in the order sent; the links' 20 ms floor in `tcpstat`, at the
+- both up, with NBS's third data link negotiated, said in the log; 200 small
+  pings each way, eight in flight, and sixteen of a megabyte by the bulk
+  connection -- every answer the bytes sent, in the order sent; the links'
+  20 ms floor in `tcpstat`, at the
   end that dialed and at the end that accepted (the accepting end's once
   kept the 200 every connection starts with, and waited out each of its
   losses ten times as long);

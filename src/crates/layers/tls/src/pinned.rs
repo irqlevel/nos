@@ -758,8 +758,8 @@ impl<S: Socket, E: End> Session<S, E> {
         self.pending.len() - self.sent
     }
 
-    /// One turn of the state machine: `app_out`, when given, encrypted once
-    /// the session can, and taken.
+    /// One turn of the state machine: a record of `app_out`, when given,
+    /// encrypted once the session can, and the rest kept for later turns.
     fn turn(&mut self, app_out: &mut Option<&[u8]>) -> Turn {
         let Self { conn, incoming, used, pending, plain, .. } = self;
         let UnbufferedStatus { mut discard, state } = conn.process(&mut incoming[..*used]);
@@ -801,9 +801,14 @@ impl<S: Socket, E: End> Session<S, E> {
             Ok(ConnectionState::BlockedHandshake) => Turn::NeedRead,
             Ok(ConnectionState::WriteTraffic(mut writer)) => match app_out.take() {
                 Some(data) => {
-                    let guess = data.len() + (data.len() / (16 * 1024) + 1) * 64;
-                    match append_with(pending, guess, |buf| writer.encrypt(data, buf), encrypt_size) {
-                        Ok(true) => Turn::Ready,
+                    let n = data.len().min(16 * 1024);
+                    let (record, rest) = data.split_at(n);
+                    let guess = record.len() + (record.len() / (16 * 1024) + 1) * 64;
+                    match append_with(pending, guess, |buf| writer.encrypt(record, buf), encrypt_size) {
+                        Ok(true) => {
+                            *app_out = if rest.is_empty() { None } else { Some(rest) };
+                            Turn::Ready
+                        }
                         Ok(false) => Turn::NoMemory,
                         Err(_) => Turn::Failed(Error::EncryptError),
                     }
@@ -1011,6 +1016,13 @@ impl<S: Socket, E: End> Session<S, E> {
         }
         if data.is_empty() {
             return true;
+        }
+        if data.len() > 16 * 1024 {
+            let overhead = (data.len() / (16 * 1024) + 1).saturating_mul(64);
+            if self.pending.try_reserve_exact(data.len().saturating_add(overhead)).is_err() {
+                self.fail(Failure::NoMemory);
+                return false;
+            }
         }
         let mut out = Some(data);
         let mut why = Failure::Stuck;

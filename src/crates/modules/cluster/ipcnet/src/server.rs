@@ -23,7 +23,7 @@ use tls::pinned::{Client, Fingerprint, Suite};
 
 use super::files::{self, Config, Dir, Identity, PeerConf};
 use super::link::{link_main, LinkCtx, Side, ALPN, HANDSHAKE_MS};
-use super::peer::{add, Locked, Peer, BULK, CLASSES, CONTROL};
+use super::peer::{add, Locked, Peer, BULK, CLASSES, CONTROL, DATA};
 
 /// What waits to go out to every host, at most: the router mailbox's own
 /// limits, the channel's largest -- a send past them is `Full`.
@@ -37,9 +37,9 @@ const HANDSHAKES_MAX: usize = 2;
 /// Connections the kernel holds for the port before the listener takes
 /// them.
 const BACKLOG: usize = 2;
-/// Connections' tasks the listener keeps at once: two a peer, and those in
+/// Connections' tasks the listener keeps at once: three a peer, and those in
 /// their handshake or their Hello.
-const ACCEPTED_MAX: usize = 2 * files::PEERS_MAX + 8;
+const ACCEPTED_MAX: usize = 3 * files::PEERS_MAX + 8;
 /// How long a listener waits for a connection at a time, and a dialer
 /// between looks at its session: how soon a stop is seen.
 const POLL_MS: u64 = 100;
@@ -144,7 +144,7 @@ fn make_clients(identity: &Identity, name: &str, keys: &[Fingerprint]) -> Result
         Client::with_suites(&identity.cert, &identity.key, keys, &[ALPN[class]], &SUITES)
             .map_err(|e| alloc::format!("{}'s TLS client could not be made: {:?}", name, e))
     };
-    Ok([client(CONTROL)?, client(BULK)?])
+    Ok([client(CONTROL)?, client(BULK)?, client(DATA)?])
 }
 
 fn make_peer(identity: &Identity, me: &str, conf: PeerConf) -> Result<Peer, String> {
@@ -390,9 +390,9 @@ fn listener_main(shared: Arc<Shared>) {
     drop(tasks);
 }
 
-/// A dialer: a session at a time -- the control connection, and once it
-/// has said its Hello the bulk one -- waited out as it ends, its links let
-/// go of then, and the next after a wait that doubles while none comes up.
+/// A dialer: a session at a time -- control, bulk and NBS's data connection
+/// -- waited out as it ends, its links let go of then, and the next after a
+/// wait that doubles while none comes up.
 fn dialer_main((shared, peer): (Arc<Shared>, Arc<Peer>)) {
     let mut backoff = BACKOFF_MIN_MS;
     while !shared.stop.load(Ordering::Acquire) && !peer.removed.load(Ordering::Acquire) {
@@ -424,6 +424,12 @@ fn dialer_main((shared, peer): (Arc<Shared>, Arc<Peer>)) {
         if bulk.is_none() {
             peer.lose(&shared.router, session, "its bulk connection never began");
         }
+        /* NBS's optional link starts only once control and bulk are up, so
+         * it cannot race their session's attach */
+        while peer.current(session) && peer.number(session).is_none() && !shared.stop.load(Ordering::Acquire) {
+            kcore::task::sleep_ms(5);
+        }
+        let data = if peer.current(session) { link(DATA) } else { None };
         /* The session waited out here, its links let go of once it is over
          * -- each at its end by then, or within a poll or a handshake's wait.
          * Joined for the session's life instead, each dialer was a wait the
@@ -436,6 +442,7 @@ fn dialer_main((shared, peer): (Arc<Shared>, Arc<Peer>)) {
         while peer.current(session) && !shared.stop.load(Ordering::Acquire) {
             kcore::task::sleep_ms(POLL_MS);
         }
+        drop(data);
         drop(bulk);
         drop(control);
         backoff = if peer.counts.ups.load(Ordering::Relaxed) != ups {

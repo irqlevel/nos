@@ -24,12 +24,11 @@ use kcore::ipc::{Addr, Bounce, Reason, RemoteTo};
 use kcore::tcp::{TcpStream, RECV_TIMEOUT};
 use tls::pinned::{Flush, Read, Recv, Socket};
 
-use super::peer::{add, OutMsg, Peer, BULK, CLASSES, CONTROL, FRAMES_MAX, MONITORS_MAX};
+use super::peer::{add, OutMsg, Peer, BULK, CLASSES, CONTROL, DATA, FRAMES_MAX, MONITORS_MAX};
 use super::server::Shared;
 
-/// What a connection says it is, by ALPN: the control connection or the
-/// bulk one of a pair.
-pub const ALPN: [&[u8]; CLASSES] = [b"nos-ipc/1", b"nos-ipc-bulk/1"];
+/// What a connection says it is, by ALPN: control, bulk, or NBS's data link.
+pub const ALPN: [&[u8]; CLASSES] = [b"nos-ipc/1", b"nos-ipc-bulk/1", b"nos-nbs/1"];
 /// A link's floor for its retransmissions: both ends are nos, which
 /// acknowledges every segment at once (plans/tcp.md, T2).
 const LINK_RTO_MS: u32 = 20;
@@ -59,6 +58,7 @@ const POLL_MS: u64 = 100;
 const MAX_PENDING: usize = 64 * 1024;
 /// A frame always fits once what waits is under MAX_PENDING.
 const WRITE_ROOM: usize = MAX_PENDING + ipcwire::FRAME_MAX + 1024;
+const DATA_WRITE_ROOM: usize = MAX_PENDING + ipcwire::WHOLE_MAX + ipcwire::WHOLE_META_MAX + 1024;
 /// Messages begun on a connection and not yet sent whole, and the bytes
 /// their heads promise: the other end's assembler is held to the same.
 pub const OPEN_MAX: usize = 8;
@@ -224,7 +224,9 @@ fn serve(shared: &Arc<Shared>, side: Side) {
     };
     let Some((mut sess, peer, class, session)) = up else { return };
     let why = run(shared, &mut sess, &peer, class, session);
-    peer.lose(&shared.router, session, why);
+    if class != DATA || (peer.number(session).is_some() && peer.nbs_class() == DATA) {
+        peer.lose(&shared.router, session, why);
+    }
     if why == "stopping" || why == "the session ended" {
         sess.close();
     } else {
@@ -236,19 +238,28 @@ fn serve(shared: &Arc<Shared>, side: Side) {
 /// class and the session's number.
 type Up = Option<(Session, Arc<Peer>, usize, u64)>;
 
+/// A data link is optional until attached: an older peer simply has none.
+/// Once attached, its failure ends the session rather than leaving NBS's
+/// messages queued for a connection that is not there.
+fn not_up(shared: &Arc<Shared>, peer: &Peer, class: usize, session: u64, why: &'static str) {
+    if class != DATA || peer.st.with(|st| st.session == session && st.attached[DATA]) {
+        peer.lose(&shared.router, session, why);
+    }
+}
+
 /// The connection of `class` for `session` dialed, its handshake made, its
 /// Hello said and heard, and the peer's session joined.
 fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up {
     let ip = peer.conf.ip;
     /* Its own port where it says one (#99), else ipcnet's */
     let port = if peer.conf.port != 0 { peer.conf.port } else { super::files::DEFAULT_PORT };
-    let stream = if class == BULK {
+    let stream = if class != CONTROL {
         TcpStream::connect_bulk(&shared.nic, ip, port)
     } else {
         TcpStream::connect(&shared.nic, ip, port)
     };
     let Some(stream) = stream else {
-        peer.lose(&shared.router, session, "no answer");
+        not_up(shared, &peer, class, session, "no answer");
         return None;
     };
     let _ = stream.set_rto_floor(LINK_RTO_MS);
@@ -260,7 +271,7 @@ fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up
             sock.tcp.abort();
             add(&shared.counters.refused_out, 1);
             kcore::klog!(0, "ipcnet: {} refused this host's handshake: {}", peer.conf.name, why.name());
-            peer.lose(&shared.router, session, "handshake refused");
+            not_up(shared, &peer, class, session, "handshake refused");
             return None;
         }
     };
@@ -268,7 +279,7 @@ fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up
                                from: shared.cfg.name.as_bytes(), to: peer.conf.name.as_bytes() };
     if !say(&mut sess, &hello) {
         sess.reset();
-        peer.lose(&shared.router, session, "hello not sent");
+        not_up(shared, &peer, class, session, "hello not sent");
         return None;
     }
     let mut inbuf = Vec::new();
@@ -282,17 +293,17 @@ fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up
     if !heard {
         add(&shared.counters.hello_refused, 1);
         sess.reset();
-        peer.lose(&shared.router, session, "its hello not this cluster's");
+        not_up(shared, &peer, class, session, "its hello not this cluster's");
         return None;
     }
     if !inbuf.is_empty() || peer.attach(&shared.router, class, session, false).is_err() {
         sess.reset();
-        peer.lose(&shared.router, session, "not let into its session");
+        not_up(shared, &peer, class, session, "not let into its session");
         return None;
     }
     if !wait_up(shared, &peer, session) {
         sess.reset();
-        peer.lose(&shared.router, session, "its other connection never came");
+        not_up(shared, &peer, class, session, "its other connection never came");
         return None;
     }
     Some((sess, peer, class, session))
@@ -327,6 +338,7 @@ fn accept(shared: &Arc<Shared>, stream: TcpStream, ip: u32) -> Up {
     let class = match s.alpn() {
         Some(p) if p == ALPN[CONTROL] => CONTROL,
         Some(p) if p == ALPN[BULK] => BULK,
+        Some(p) if p == ALPN[DATA] => DATA,
         _ => {
             s.into_socket().tcp.abort();
             add(&shared.counters.hello_refused, 1);
@@ -366,12 +378,12 @@ fn accept(shared: &Arc<Shared>, stream: TcpStream, ip: u32) -> Up {
                                from: shared.cfg.name.as_bytes(), to: peer.conf.name.as_bytes() };
     if !say(&mut sess, &hello) {
         sess.reset();
-        peer.lose(&shared.router, session, "hello not sent");
+        not_up(shared, &peer, class, session, "hello not sent");
         return None;
     }
     if !wait_up(shared, &peer, session) {
         sess.reset();
-        peer.lose(&shared.router, session, "its other connection never came");
+        not_up(shared, &peer, class, session, "its other connection never came");
         return None;
     }
     Some((sess, peer, class, session))
@@ -477,6 +489,41 @@ struct Sender {
 }
 
 impl Sender {
+    /// NBS's next message whole where it fits. A larger one uses the usual
+    /// Head/Body path to its end, so nothing overtakes it.
+    fn next_data(&mut self, peer: &Peer, b: &mut Vec<u8>) -> bool {
+        if !self.open.is_empty() || peer.out[DATA].with(|o| !o.frames.is_empty()) {
+            return self.next(peer, DATA, b);
+        }
+        let small = peer.out[DATA].with(|o| o.msgs.front().is_some_and(|m| m.len <= ipcwire::WHOLE_MAX));
+        if !small {
+            return self.next(peer, DATA, b);
+        }
+        b.clear();
+        peer.out[DATA].with(|o| {
+            let Some(m) = o.msgs.front() else { return false };
+            let to = match &m.to {
+                Dest::Addr(a) => To::Addr(*a),
+                Dest::Name(n) => To::Name(n),
+            };
+            let mut pieces = Vec::new();
+            if pieces.try_reserve(m.pieces.len()).is_err() {
+                return false;
+            }
+            let Some(first) = m.pieces.first().and_then(|p| p.get(m.skip..)) else { return false };
+            pieces.push(first);
+            pieces.extend(m.pieces.iter().skip(1).map(|p| &p[..]));
+            if ipcwire::encode_whole(to, m.from, m.tag, m.reference, &pieces, b).is_err() {
+                return false;
+            }
+            let Some(m) = o.msgs.pop_front() else { return false };
+            o.bytes = o.bytes.saturating_sub(m.len);
+            add(&peer.counts.sent, 1);
+            add(&peer.counts.bytes_out, m.len as u64);
+            true
+        })
+    }
+
     /// The next frame to go, encoded into `b`: small frames first, then a
     /// message begun -- when there is room for one -- or the next piece of
     /// one begun, in turn.
@@ -640,10 +687,12 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
                 capped = true;
                 break;
             }
-            if !sender.next(peer, class, &mut frame) {
+            let next = if class == DATA { sender.next_data(peer, &mut frame) } else { sender.next(peer, class, &mut frame) };
+            if !next {
                 break;
             }
-            if !sess.write(&frame, WRITE_ROOM) {
+            let room = if class == DATA { DATA_WRITE_ROOM } else { WRITE_ROOM };
+            if !sess.write(&frame, room) {
                 return failed(&sess);
             }
             moved = true;
@@ -740,6 +789,14 @@ fn take(shared: &Shared, peer: &Peer, class: usize, number: u16, asm: &mut Assem
                 }
             }
         }
+        Frame::Whole { to, from, tag, reference, data } if class == DATA => {
+            add(&peer.counts.bytes_in, data.len() as u64);
+            let to = match to {
+                To::Addr(a) => Dest::Addr(a),
+                To::Name(n) => Dest::Name(n.to_vec()),
+            };
+            deliver_parts(shared, peer, number, &to, from, tag, reference, &[data]);
+        }
         Frame::Bounced { from, to, tag, reference, why } => {
             let why = Bounce::from_code(u32::from(why)).unwrap_or(Bounce::Unsent);
             let to = match to {
@@ -766,7 +823,7 @@ fn take(shared: &Shared, peer: &Peer, class: usize, number: u16, asm: &mut Assem
             /* A reason nobody knows is the host's word that it lost track */
             let _ = router.remote_down(number, id, Reason::from_code(u32::from(reason)).unwrap_or(Reason::HostLost));
         }
-        Frame::Hello { .. } | Frame::Monitor { .. } | Frame::Demonitor { .. } | Frame::Down { .. } => {
+        Frame::Hello { .. } | Frame::Whole { .. } | Frame::Monitor { .. } | Frame::Demonitor { .. } | Frame::Down { .. } => {
             add(&shared.counters.wire_refused, 1);
             return Err("a frame out of its place");
         }
@@ -783,7 +840,13 @@ pub fn byte(code: u32) -> u8 {
 /// bounced back -- full, gone -- or, for what the peer may not reach here,
 /// dropped and counted.
 fn deliver(shared: &Shared, peer: &Peer, number: u16, m: ipcwire::Message) {
-    let (to, name) = match &m.to {
+    let pieces: Vec<&[u8]> = m.pieces.iter().map(|p| &p[..]).collect();
+    deliver_parts(shared, peer, number, &m.to, m.from, m.tag, m.reference, &pieces);
+}
+
+fn deliver_parts(shared: &Shared, peer: &Peer, number: u16, dest: &Dest, from: u64, tag: u32, reference: u64,
+                 pieces: &[&[u8]]) {
+    let (to, name) = match dest {
         Dest::Addr(a) => (Addr(*a), None),
         Dest::Name(n) => match core::str::from_utf8(n) {
             Ok(n) => (Addr::NONE, Some(n)),
@@ -797,9 +860,8 @@ fn deliver(shared: &Shared, peer: &Peer, number: u16, m: ipcwire::Message) {
         add(&peer.counts.refused, 1);
         return;
     }
-    let pieces: Vec<&[u8]> = m.pieces.iter().map(|p| &p[..]).collect();
     add(&peer.counts.received, 1);
-    let why = match shared.router.deliver_remote(number, m.from, to, name, m.tag, m.reference, &pieces) {
+    let why = match shared.router.deliver_remote(number, from, to, name, tag, reference, pieces) {
         Ok(()) => return,
         Err(kcore::ipc::Error::Full) => Bounce::Full,
         Err(kcore::ipc::Error::Gone) => Bounce::Gone,
@@ -808,13 +870,12 @@ fn deliver(shared: &Shared, peer: &Peer, number: u16, m: ipcwire::Message) {
             return;
         }
     };
-    let to = match &m.to {
+    let to = match dest {
         Dest::Addr(a) => To::Addr(*a),
         Dest::Name(n) => To::Name(n),
     };
     add(&peer.counts.bounced_out, 1);
-    push_frame(peer, CONTROL, &Frame::Bounced { from: m.from, to, tag: m.tag, reference: m.reference,
-                                                why: byte(why.code()) });
+    push_frame(peer, CONTROL, &Frame::Bounced { from, to, tag, reference, why: byte(why.code()) });
 }
 
 /// The peer asks this host to watch its mailbox `target`, and say `Down`

@@ -50,7 +50,7 @@ const SERVER_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x64];
 /// What the client offers by ALPN: ipcnet's.
 const ALPN: &[u8] = b"nos-ipc/1";
 /// What waits to be sent, at most, before the client flushes.
-const MAX_PENDING: usize = 64 * 1024;
+const MAX_PENDING: usize = 512 * 1024;
 /// How long the client waits for what it said to come back.
 const ECHO_MS: u64 = 20_000;
 /// Connections an input makes at most.
@@ -141,7 +141,7 @@ fn plan(r: &mut Input) -> Plan {
         _ => vec![ALPN],
     };
     let lines = (0..r.below(6)).map(|i| {
-        let len = r.pick(&[1usize, 10, 100, 1000, 17_000]);
+        let len = r.pick(&[1usize, 10, 100, 1000, 17_000, 384 * 1024]);
         (0..len).map(|k| b'a' + ((i as usize * 7 + k) % 26) as u8).collect()
     }).collect();
     Plan { show, ask, brk, alpn, lines }
@@ -414,6 +414,8 @@ fn connect((client, lines): (Arc<Client>, Vec<Vec<u8>>)) -> Outcome {
     let alpn = s.alpn().map(|a| a.to_vec());
     let suite = s.suite();
     let want: usize = lines.iter().map(|l| l.len()).sum();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 2048];
     let mut ended = "done";
     'say: for line in &lines {
         while !s.write(line, MAX_PENDING) {
@@ -421,10 +423,20 @@ fn connect((client, lines): (Arc<Client>, Vec<Vec<u8>>)) -> Outcome {
                 ended = "failed";
                 break 'say;
             }
+            match s.read(&mut buf, 1) {
+                Read::Data(n) => got.extend_from_slice(&buf[..n]),
+                Read::Idle => {}
+                Read::End => {
+                    ended = "end";
+                    break 'say;
+                }
+                Read::Failed => {
+                    ended = "failed";
+                    break 'say;
+                }
+            }
         }
     }
-    let mut got = Vec::new();
-    let mut buf = [0u8; 2048];
     let mut idle = 0;
     while ended == "done" && got.len() < want {
         if s.flush(1000) == Flush::Failed {

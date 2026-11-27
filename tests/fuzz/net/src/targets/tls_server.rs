@@ -50,7 +50,7 @@ const MAX_CONNS: usize = 4;
 /// A connection let in that says nothing for this long is let go.
 const IDLE_MS: u64 = 60_000;
 /// What waits to be sent, at most, before the server flushes.
-const MAX_PENDING: usize = 64 * 1024;
+const MAX_PENDING: usize = 512 * 1024;
 /// Clients an input makes at most.
 const CLIENTS: usize = 16;
 
@@ -249,7 +249,7 @@ fn plan(r: &mut Input) -> Plan {
         _ => vec![b"nos-api/1"],
     };
     let lines = (0..r.below(6)).map(|i| {
-        let len = r.pick(&[1usize, 10, 100, 600]);
+        let len = if r.u8() % 64 == 0 { 384 * 1024 } else { r.pick(&[1usize, 10, 100, 600]) };
         let mut l: Vec<u8> = (0..len).map(|k| b'a' + ((i as usize * 7 + k) % 26) as u8).collect();
         l.push(b'\n');
         l
@@ -317,7 +317,8 @@ fn judge(c: &Client, s: &Option<Seen>, known: &Fingerprint) {
             }
             Who::Known => {
                 let Some(Seen::Accepted { alpn, lines, ended, .. }) = s else {
-                    invariant!(false, "the known key was not let in: {:?} {:?}, seen {:?}", p.brk, p.alpn, s);
+                    invariant!(false, "the known key was not let in: {:?} {:?}, seen {:?}, client {:?}, up {}, {} lines, {} bytes",
+                               p.brk, p.alpn, s, c.ending, c.up, c.lines_sent, c.got.len());
                     return;
                 };
                 let agreed = ALPN.iter().find(|a| p.alpn.contains(a)).map(|a| a.to_vec());

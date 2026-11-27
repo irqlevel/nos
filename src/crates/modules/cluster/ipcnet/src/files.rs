@@ -39,7 +39,7 @@ pub const DEFAULT_NIC: &str = "eth0";
 /// The most hosts.toml may be, and a key or a certificate.
 const HOSTS_MAX_BYTES: usize = 16 * 1024;
 const PEM_MAX: usize = 16 * 1024;
-/// Peers at most: each is two connections, two tasks and their buffers.
+/// Peers at most: each is up to three connections and their buffers.
 pub const PEERS_MAX: usize = 16;
 /// Keys a peer may be pinned by: its own, and the one it moves to.
 const KEYS_MAX: usize = 2;

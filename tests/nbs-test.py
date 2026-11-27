@@ -529,6 +529,8 @@ def main():
             need("%s joins the registry" % host, "joined as node" in out, out)
         everyone = [(x, y) for x in sh for y in HOSTS if y != HOSTS[sh.index(x)]]
         need("every host up to every other", ipct.wait_for(lambda: all(ipct.peer_up(x, y) for x, y in everyone), 60, 1))
+        check("NBS has its own data link on every peer", all("nbs data" in x.run("ipcnet") for x in sh),
+              [x.run("ipcnet") for x in sh])
 
         # -- an NBS cluster of a, then b and c added --
         out = a.run("nbs")

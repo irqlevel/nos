@@ -921,7 +921,7 @@ hosts](cluster.md)), recorded by the module's router and its peers
 |---|---|
 | `ipcnet_link` | a peer's session `up` (1), or lost (0): the peer's host number in the channel, its sessions up and lost so far (`ups`, `losses`) |
 | `ipcnet_queue` | a message the router queued for a peer: its `reference` -- an NBS request's id -- its `bytes`, which class's queue (`bulk` 1, control 0) and that queue's bytes with it (`queued`) |
-| `ipcnet_bounce` | a message for a peer bounced back to its sender, and `why`: its class's queue `full` (1 MiB control, 4 MiB bulk), the peer `down` -- not up, or up in another session than the message's -- or its session `lost` before it went |
+| `ipcnet_bounce` | a message for a peer bounced back to its sender, and `why`: its class's queue `full` (1 MiB control, 4 MiB bulk or NBS data), the peer `down` -- not up, or up in another session than the message's -- or its session `lost` before it went |
 
 So how full a peer's queues run is the `queued` of its `ipcnet_queue`s, and
 what went back to its senders, and why, is its `ipcnet_bounce`s -- the

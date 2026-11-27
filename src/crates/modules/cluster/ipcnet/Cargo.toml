@@ -14,8 +14,9 @@ kcore = { path = "../../../base/kcore" }
 tls = { path = "../../../layers/tls", features = ["pinned"] }
 # The host's key and its certificate, made at the first start.
 web = { path = "../../../common/net/web" }
-# What two hosts say inside their session.
+# What two hosts say inside their session, and NBS's request/answer tags.
 ipcwire = { path = "../../../common/ipc/ipcwire" }
+nbswire = { path = "../../../common/storage/nbswire" }
 # An address read and printed, with its port (#99): the one copy of a quad
 netwire = { path = "../../../common/net/netwire" }
 # hosts.toml.

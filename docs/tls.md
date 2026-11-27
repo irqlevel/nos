@@ -123,8 +123,9 @@ apart.
 - **Every wait bounded.** The session runs over a `tls::pinned::Socket`,
   whose reads and sends each wait at most what they are given. `read` with
   nothing in its time answers `Idle`, which is no error; `write` encrypts
-  into the session's own queue, bounded by what the caller allows, and
-  `flush` sends from it for as long as it is given -- so a client that stops
+  into the session's own queue, bounded by what the caller allows, splitting
+  a large buffer into records of at most 16 KiB, and `flush` sends from it
+  for as long as it is given -- so a client that stops
   reading holds up its own connection's task and nobody else.
 - **A failure says why.** `read`'s `Failed`, a `write` that is refused and
   `flush`'s `Failed` all end the session, and `failure` says what ended it,

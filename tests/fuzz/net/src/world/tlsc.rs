@@ -396,7 +396,7 @@ impl Client {
                         }
                     } else if self.lines_sent < self.plan.lines.len() && self.got.len() >= before[self.lines_sent] {
                         let line = self.plan.lines[self.lines_sent].clone();
-                        let mut buf = vec![0u8; line.len() + 512];
+                        let mut buf = vec![0u8; line.len() + (line.len() / (16 * 1024) + 1) * 64];
                         match writer.encrypt(&line, &mut buf) {
                             Ok(n) => {
                                 if tamper_at == Some(self.lines_sent) && !self.tampered {

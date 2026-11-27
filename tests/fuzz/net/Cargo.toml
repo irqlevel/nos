@@ -38,6 +38,7 @@ zeroize = { version = "1", default-features = false }
 # ipcnet target, over the module's source).
 ipc = { path = "../../../src/crates/layers/ipc" }
 ipcwire = { path = "../../../src/crates/common/ipc/ipcwire" }
+nbswire = { path = "../../../src/crates/common/storage/nbswire" }
 # The other end of the protocols the kernel speaks: the fuzzer's TLS server
 # and SSH client. The features are the kernel's own, so that the crates the
 # two share are built the same.

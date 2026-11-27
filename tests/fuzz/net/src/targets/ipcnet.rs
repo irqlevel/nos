@@ -1,8 +1,8 @@
 //! `ipcnet`: the ipcnet module -- its source, as the kernel builds it into
 //! ipcnet.ko -- as host `b` of a cluster whose other host, `a`, is the
 //! world's: on the LAN, pinned by the key the world shows, dialing `b`
-//! (its name sorts first) on both of a session's connections, control and
-//! bulk, and speaking ipcwire inside them -- its Hello, Pongs for `b`'s
+//! (its name sorts first) on a session's control, bulk and NBS data
+//! connections, and speaking ipcwire inside them -- its Hello, Pongs for `b`'s
 //! Pings, and the messages, monitors and bounces the input says.
 //!
 //! On the machine, the channel (the `ipc` crate, the image's) with two
@@ -69,11 +69,23 @@ const OTHER_CLUSTER: [u8; 16] = *b"nos-ipc-fuzz-0x2";
 const A_BOX: u64 = (3 << 32) | 1;
 const A_BOX2: u64 = (4 << 32) | 1;
 /// What the classes' connections say they are.
-const ALPN: [&[u8]; 2] = [b"nos-ipc/1", b"nos-ipc-bulk/1"];
+const ALPN: [&[u8]; 3] = [b"nos-ipc/1", b"nos-ipc-bulk/1", b"nos-nbs/1"];
 const CONTROL: usize = 0;
 const BULK: usize = 1;
+const DATA: usize = 2;
 /// The bulk bit of a tag (the channel's TAG_BULK).
 const TAG_BULK: u32 = 0x4000_0000;
+
+fn tag_class(tag: u32) -> usize {
+    let kind = tag & !TAG_BULK;
+    if kind == nbswire::TAG_REQUEST || kind == nbswire::TAG_ANSWER {
+        DATA
+    } else if tag & TAG_BULK != 0 {
+        BULK
+    } else {
+        CONTROL
+    }
+}
 /// The machine's sink: its limits, small enough for a pause to fill.
 const SINK_LIMITS: Limits = Limits { messages: 4, bytes: 96 << 10 };
 /// How late a loss may be seen past the module's 3 s: a Ping's period and
@@ -112,7 +124,7 @@ static A_ONLY_LIFTS: AtomicU64 = AtomicU64::new(0);
 
 /// What a monitor of the world's may have met of `a` as a host invited:
 /// whether `a` was one as it was asked, and the lists of each kind by then.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Invited {
     only: bool,
     sets: u64,
@@ -275,8 +287,12 @@ impl Speaker {
         self.queue.push_back(b);
     }
 
-    /// A message of the world's, cut into its frames.
+    /// A message of the world's, whole on NBS's link, otherwise cut into frames.
     fn message(&mut self, msg: u32, to: To<'_>, from: u64, tag: u32, reference: u64, data: &[u8]) {
+        if self.class == DATA && matches!(tag & !TAG_BULK, nbswire::TAG_REQUEST | nbswire::TAG_ANSWER) {
+            self.say(&Frame::Whole { to, from, tag, reference, data });
+            return;
+        }
         for f in ipcwire::frames(msg, to, from, tag, reference, data).expect("a message within the limit") {
             self.say(&f);
         }
@@ -323,6 +339,17 @@ impl Speaker {
                 Ok(None) => {}
                 Err(e) => self.broken = Some(format!("the machine's message past an assembler's limits: {:?}", e)),
             },
+            Frame::Whole { to, from, tag, reference, data } => {
+                if self.class != DATA {
+                    self.broken = Some(String::from("the machine said a whole NBS message on another connection"));
+                    return;
+                }
+                let to = match to {
+                    To::Addr(a) => Dest::Addr(a),
+                    To::Name(n) => Dest::Name(n.to_vec()),
+                };
+                self.got.push(ipcwire::Message { to, from, tag, reference, pieces: vec![data.to_vec()] });
+            }
             Frame::Pong { seq } => self.ponged.push(seq),
             Frame::Down { id, reason } => {
                 if self.class != CONTROL {
@@ -508,7 +535,7 @@ fn a_up() -> Option<u16> {
 /// message as the sink should get it, `from` but for its host.
 struct Sent {
     by_name: bool,
-    bulk: bool,
+    invited: Invited,
     from: u64,
     tag: u32,
     reference: u64,
@@ -563,7 +590,7 @@ pub fn ipcnet(r: &mut Input) {
 
     let mut sent: Vec<Sent> = Vec::new();
     let mut said: Vec<Msg> = Vec::new();
-    let mut next_msg = [1u32; 2];
+    let mut next_msg = [1u32; 3];
     let mut session = 0u64;
     let mut port = 41000u16;
     let mut silent_since: Option<u64> = None;
@@ -608,8 +635,8 @@ pub fn ipcnet(r: &mut Input) {
                  * from a source at a time -- and now and then both at once,
                  * the second of which it resets */
                 let together = r.u8() < 24;
-                for class in [CONTROL, BULK] {
-                    if class == BULK && !together {
+                for class in [CONTROL, BULK, DATA] {
+                    if class != CONTROL && !together {
                         let control = w.peers.links.last().map(|l| l.speaker.clone());
                         if let Some(c) = control {
                             let end = sched::now() + 2 * SEC;
@@ -631,9 +658,9 @@ pub fn ipcnet(r: &mut Input) {
                 }
                 silent_since = None;
                 w.run_for(300 * MS);
-                let fresh_up = w.peers.links.iter().rev().take(2).all(|l| l.speaker.borrow().up());
+                let fresh_up = w.peers.links.iter().rev().take(3).all(|l| l.speaker.borrow().up());
                 if who != Who::Known {
-                    invariant!(w.peers.links.iter().rev().take(2).all(|l| !l.speaker.borrow().up()),
+                    invariant!(w.peers.links.iter().rev().take(3).all(|l| !l.speaker.borrow().up()),
                                "a key not the pinned one let up");
                     reached("ipcnet: a key not the pinned one refused");
                 } else if fresh_up && a_up().is_some() {
@@ -644,8 +671,15 @@ pub fn ipcnet(r: &mut Input) {
                 /* A message to the sink, by name -- or by its address, which
                  * reaches it only once the sink has sent to `a` */
                 let Some(i) = w.peers.links.iter().rposition(|l| l.speaker.borrow().up()) else { continue };
-                let bulk = r.bool();
-                let class = if bulk { BULK } else { CONTROL };
+                let nbs = r.u8() % 4 == 0;
+                let (class, tag) = if nbs {
+                    let kind = if r.bool() { nbswire::TAG_REQUEST } else { nbswire::TAG_ANSWER };
+                    (DATA, kind | TAG_BULK)
+                } else if r.bool() {
+                    (BULK, 7 | TAG_BULK)
+                } else {
+                    (CONTROL, 7)
+                };
                 /* The live session's connection of that class */
                 let Some(j) = w.peers.links.iter().rposition(|l| {
                     let s = l.speaker.borrow();
@@ -658,7 +692,6 @@ pub fn ipcnet(r: &mut Input) {
                     _ => r.below(300) as usize,
                 };
                 let data: Vec<u8> = (0..len).map(|k| (k as u8).wrapping_mul(13) ^ r.u8()).collect();
-                let tag = if bulk { 7 | TAG_BULK } else { 7 };
                 let reference = next_ref << 16 | u64::from(r.u16());
                 next_ref += 1;
                 let from = if r.u8() < 230 { A_BOX } else { A_BOX2 };
@@ -667,7 +700,7 @@ pub fn ipcnet(r: &mut Input) {
                 let num = next_msg[class];
                 next_msg[class] = next_msg[class].wrapping_add(1).max(1);
                 w.peers.links[j].speaker.borrow_mut().message(num, to, from, tag, reference, &data);
-                sent.push(Sent { by_name, bulk, from, tag, reference, data });
+                sent.push(Sent { by_name, invited: Invited::now(), from, tag, reference, data });
                 flush(&mut w);
             }
             3 => {
@@ -689,7 +722,13 @@ pub fn ipcnet(r: &mut Input) {
                 /* Of a frame's bytes or a few: two of them begun at once could
                  * end, and be delivered, out of their order */
                 let len = if r.u8() < 64 { r.below(BYTES_MAX as u64) as usize } else { r.below(200) as usize };
-                let m = Msg { from: sink_addr, tag: if r.bool() { 5 | TAG_BULK } else { 5 }, reference: r.u64(),
+                let tag = match r.u8() % 4 {
+                    0 => nbswire::TAG_ANSWER | TAG_BULK,
+                    1 => nbswire::TAG_REQUEST | TAG_BULK,
+                    2 => 5 | TAG_BULK,
+                    _ => 5,
+                };
+                let m = Msg { from: sink_addr, tag, reference: r.u64(),
                               data: (0..len).map(|k| (k as u8) ^ 0x5A ^ (len as u8)).collect() };
                 said.push(m.clone());
                 sink_sends.lock().unwrap_or_else(|e| e.into_inner()).push_back(m);
@@ -712,7 +751,7 @@ pub fn ipcnet(r: &mut Input) {
                     0 => s.queue.push_back(vec![0xEE, 0, 0, 0, 0, 0, 0, 1, 0]),
                     1 => s.say(&Frame::Hello { version: 1, cluster: CLUSTER, session: 1, from: b"a", to: b"b" }),
                     _ => {
-                        if s.class == BULK {
+                        if s.class != CONTROL {
                             s.say(&Frame::Monitor { id: 1, target: 2 });
                         } else {
                             s.say(&Frame::Body { msg: 999, data: b"x" });
@@ -781,7 +820,7 @@ pub fn ipcnet(r: &mut Input) {
                     let data: Vec<u8> = (0..r.below(64) as usize).map(|k| k as u8).collect();
                     w.peers.links[j].speaker.borrow_mut().message(num, To::Name(b"nbs.sink"), A_BOX, 11, reference,
                                                                    &data);
-                    sent.push(Sent { by_name: true, bulk: false, from: A_BOX, tag: 11, reference, data });
+                    sent.push(Sent { by_name: true, invited: Invited::now(), from: A_BOX, tag: 11, reference, data });
                 }
                 flush(&mut w);
                 w.run_for(200 * MS);
@@ -1043,11 +1082,11 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
     }
     /* What reached the sink: the world's, each once, in order within a
      * class and a sender -- and by address only once the sink had sent */
-    for class in [false, true] {
+    for class in [CONTROL, BULK, DATA] {
         for from in [A_BOX, A_BOX2] {
-            let mine: Vec<&Sent> = sent.iter().filter(|x| x.bulk == class && x.from == from).collect();
+            let mine: Vec<&Sent> = sent.iter().filter(|x| tag_class(x.tag) == class && x.from == from).collect();
             let mut at = 0;
-            for (g, sent_ok, only) in s.sink.iter().filter(|(g, _, _)| (g.tag & TAG_BULK != 0) == class
+            for (g, sent_ok, only) in s.sink.iter().filter(|(g, _, _)| tag_class(g.tag) == class
                                                                  && (g.from & 0xFFFF_FFFF_FFFF) == from) {
                 let Some(k) = mine[at..].iter().position(|x| x.tag == g.tag && x.reference == g.reference && x.data == g.data)
                     else {
@@ -1057,8 +1096,8 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
                 let x = mine[at + k];
                 invariant!(x.by_name || *sent_ok, "a message to the sink's address reached it before the sink had \
                            sent to the world's host");
-                invariant!(x.by_name || !*only, "a message to the sink's address reached it while the world's host \
-                           was a host invited, which may reach it by its name alone");
+                invariant!(x.by_name || !*only || x.invited != Invited::now(), "a message to the sink's address reached \
+                           it while the world's host was a host invited, which may reach it by its name alone");
                 if *only {
                     reached("ipcnet: a host invited reached the one name it may, by that name");
                 }
@@ -1070,11 +1109,11 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
     /* What reached the world: the sink's, each once, in order within a
      * class -- the connections in the order they were made, a session's
      * after the one before */
-    for class in [false, true] {
-        let mine: Vec<&Msg> = said.iter().filter(|m| (m.tag & TAG_BULK != 0) == class).collect();
+    for class in [CONTROL, BULK, DATA] {
+        let mine: Vec<&Msg> = said.iter().filter(|m| tag_class(m.tag) == class).collect();
         let mut at = 0;
         let speakers: Vec<std::cell::Ref<'_, Speaker>> = w.peers.links.iter().map(|l| l.speaker.borrow()).collect();
-        for g in speakers.iter().flat_map(|sp| sp.got.iter()).filter(|g| (g.tag & TAG_BULK != 0) == class) {
+        for g in speakers.iter().flat_map(|sp| sp.got.iter()).filter(|g| tag_class(g.tag) == class) {
             let data: Vec<u8> = g.pieces.concat();
             let Some(k) = mine[at..].iter().position(|m| m.tag == g.tag && m.reference == g.reference && m.data == data)
                 else {
