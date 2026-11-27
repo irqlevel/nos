@@ -95,7 +95,7 @@ impl Log {
     }
 
     /// A run of RAM, `size` bytes from `base`, both whole pages: its marks,
-    /// none set. False out of memory.
+    /// none set. False out of memory. Runs stay ordered by base for `take`.
     pub fn add(&mut self, base: u64, size: u64) -> bool {
         let pages = size / PAGE;
         let Ok(mut n) = usize::try_from(pages.div_ceil(BITS)) else { return false };
@@ -113,7 +113,8 @@ impl Log {
             pieces.push(words);
             n -= k;
         }
-        self.regions.push(Bits { base, pages, pieces });
+        let at = self.regions.binary_search_by_key(&base, |r| r.base).unwrap_or_else(|at| at);
+        self.regions.insert(at, Bits { base, pages, pieces });
         true
     }
 
@@ -172,8 +173,8 @@ impl Log {
         true
     }
 
-    /// The pages marked since the last take, each handed to `out` -- and,
-    /// with `table`, read-only to the guest again before it is handed: a
+    /// The pages marked since the last take, lowest address first, each
+    /// handed to `out` -- and, with `table`, read-only again before handed: a
     /// round's, the TLBs the caller's to flush before it reads them. Without
     /// one, the guest paused: its last. How many pages it handed, or None
     /// where a page could not be protected: the round is no good.

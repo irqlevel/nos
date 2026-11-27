@@ -36,6 +36,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::Ordering;
 
 use hv::run::{LinuxGuest, Stop};
+use kcore::chunked::Chunked;
 use kcore::ipc::{Addr, Limits, Mailbox, Scope};
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
@@ -492,21 +493,115 @@ impl Sent {
     }
 }
 
-/// `pages`, the addresses of pages, as runs of them: each a first page's
-/// address and the bytes from it, lowest first.
-fn runs_of(pages: &mut [u64]) -> Result<Vec<(u64, u64)>, String> {
-    pages.sort_unstable();
-    let mut runs: Vec<(u64, u64)> = Vec::new();
-    for &gpa in pages.iter() {
-        match runs.last_mut() {
-            Some((base, size)) if *base + *size == gpa => *size += PAGE,
-            _ => {
-                runs.try_reserve(1).map_err(|_| String::from("out of memory"))?;
-                runs.push((gpa, PAGE));
-            }
+/// A round's pages: the dirty log's already ordered, and the rings' few to
+/// sort and merge in. The log can name every page of a large guest, so no
+/// contiguous vector of them or of their runs is needed.
+struct RoundPages {
+    logged: Chunked<u64>,
+    rings: Vec<u64>,
+    lost: bool,
+}
+
+impl RoundPages {
+    fn new() -> RoundPages {
+        RoundPages { logged: Chunked::new(), rings: Vec::new(), lost: false }
+    }
+
+    fn note(&mut self, gpa: u64) {
+        self.lost |= self.logged.try_push(gpa).is_err();
+    }
+
+    fn note_ring(&mut self, gpa: u64) {
+        if self.rings.try_reserve(1).is_ok() {
+            self.rings.push(gpa);
+        } else {
+            self.lost = true;
         }
     }
-    Ok(runs)
+
+    fn finish(&mut self) {
+        self.rings.sort_unstable();
+        self.rings.dedup();
+    }
+
+    fn pages(&self) -> impl Iterator<Item = u64> + '_ {
+        MergedPages { logged: self.logged.iter().copied().peekable(), rings: self.rings.iter().copied().peekable(),
+                      last: None }
+    }
+
+    fn runs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        runs_of(self.pages())
+    }
+}
+
+/// Two ordered page iterators merged, a page named by both passed on once.
+struct MergedPages<I: Iterator<Item = u64>, J: Iterator<Item = u64>> {
+    logged: core::iter::Peekable<I>,
+    rings: core::iter::Peekable<J>,
+    last: Option<u64>,
+}
+
+impl<I: Iterator<Item = u64>, J: Iterator<Item = u64>> Iterator for MergedPages<I, J> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        loop {
+            let gpa = match (self.logged.peek(), self.rings.peek()) {
+                (Some(&a), Some(&b)) => {
+                    if a <= b {
+                        self.logged.next();
+                        a
+                    } else {
+                        self.rings.next();
+                        b
+                    }
+                }
+                (Some(&a), None) => {
+                    self.logged.next();
+                    a
+                }
+                (None, Some(&b)) => {
+                    self.rings.next();
+                    b
+                }
+                (None, None) => return None,
+            };
+            if self.last == Some(gpa) {
+                continue;
+            }
+            self.last = Some(gpa);
+            return Some(gpa);
+        }
+    }
+}
+
+/// Ordered pages as runs: each a first page's address and the bytes from it.
+struct PageRuns<I: Iterator<Item = u64>> {
+    pages: I,
+    next: Option<(u64, u64)>,
+}
+
+impl<I: Iterator<Item = u64>> Iterator for PageRuns<I> {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<(u64, u64)> {
+        let (mut base, mut size) = self.next.take()?;
+        for gpa in self.pages.by_ref() {
+            if base + size == gpa {
+                size += PAGE;
+            } else {
+                self.next = Some((gpa, PAGE));
+                return Some((base, size));
+            }
+        }
+        Some((base, size))
+    }
+}
+
+fn runs_of(pages: impl IntoIterator<Item = u64>) -> PageRuns<impl Iterator<Item = u64>> {
+    let mut pages = pages.into_iter();
+    let next = pages.next().map(|gpa| (gpa, PAGE));
+    PageRuns { pages, next }
 }
 
 /* A migration's records (docs/tracing.md, group `migrate`): each asks
@@ -559,8 +654,8 @@ fn trace_recv(id: u64, seq: u64, bytes: usize, ns: u64, kind: trace::MigKind) {
 /// the address of its first page and the bytes from there, read a piece at
 /// a time. A page of zeros after the first round is one the other host
 /// writes zeros over.
-fn send_pages(tx: &mut Sender<'_>, guest: &LinuxGuest, runs: &[(u64, u64)], round: u32, work: &mut dyn Work,
-              progress: &mut Progress) -> Result<Sent, String> {
+fn send_pages(tx: &mut Sender<'_>, guest: &LinuxGuest, runs: impl IntoIterator<Item = (u64, u64)>, round: u32,
+              work: &mut dyn Work, progress: &mut Progress) -> Result<Sent, String> {
     let oom = || String::from("out of memory");
     let page = PAGE as usize;
     let mut buf = Vec::new();
@@ -583,7 +678,7 @@ fn send_pages(tx: &mut Sender<'_>, guest: &LinuxGuest, runs: &[(u64, u64)], roun
         data.try_reserve_exact(migwire::PAGES_DATA_MAX * page).map_err(|_| oom())?;
         r
     };
-    for &(base, size) in runs {
+    for (base, size) in runs {
         let mut gpa = base;
         let end = base + size;
         while gpa < end {
@@ -768,7 +863,7 @@ fn send_away(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn W
         /* The first round: its folder's files, then every page */
         let at = now_ms();
         let file_bytes = send_files(&mut tx, &p.files)?;
-        let first = send_pages(&mut tx, &guest, &p.ranges, 0, work, &mut progress)?;
+        let first = send_pages(&mut tx, &guest, p.ranges.iter().copied(), 0, work, &mut progress)?;
         let mut took = now_ms() - at;
         let mut marked = guest.log_marked();
         trace_round(id, 0, &first, took, marked, 0, cold);
@@ -802,21 +897,14 @@ fn send_away(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn W
                 0
             };
             guest.throttle(throttle);
-            let mut pages: Vec<u64> = Vec::new();
-            let _ = pages.try_reserve(marked as usize + 64);
-            let mut lost = false;
-            guest.log_round(&mut |gpa| {
-                if pages.try_reserve(1).is_ok() {
-                    pages.push(gpa);
-                } else {
-                    lost = true;
-                }
-            })?;
-            if lost {
+            let mut pages = RoundPages::new();
+            guest.log_round(&mut |gpa| pages.note(gpa))?;
+            if pages.lost {
                 return Err(String::from("out of memory for a round's pages"));
             }
+            pages.finish();
             let at = now_ms();
-            let sent = send_pages(&mut tx, &guest, &runs_of(&mut pages)?, round, work, &mut progress)?;
+            let sent = send_pages(&mut tx, &guest, pages.runs(), round, work, &mut progress)?;
             took = now_ms() - at;
             rate = (sent.bytes() / took.max(1)).max(1);
             marked = guest.log_marked();
@@ -841,32 +929,23 @@ fn send_away(state: &State, word: &str, host: &str, cold: bool, work: &mut dyn W
                 guest.settle().map_err(|e| alloc::format!("its disks not drained: {}", e))?;
                 let bytes = state_bytes(&guest)?;
                 flows = taken.port.map(|p| state.vms.port_flows(p)).unwrap_or_default();
-                let mut pages: Vec<u64> = Vec::new();
-                let mut lost = false;
-                let mut note = |gpa: u64| {
-                    if pages.try_reserve(1).is_ok() {
-                        pages.push(gpa);
-                    } else {
-                        lost = true;
-                    }
-                };
-                guest.log_last(&mut note);
+                let mut pages = RoundPages::new();
+                guest.log_last(&mut |gpa| pages.note(gpa));
                 guest.ring_ranges(&mut |base, len| {
                     let mut gpa = base & !(PAGE - 1);
                     while gpa < base + len {
-                        note(gpa);
+                        pages.note_ring(gpa);
                         gpa += PAGE;
                     }
                 });
-                if lost {
+                if pages.lost {
                     return Err(String::from("out of memory for the last round's pages"));
                 }
                 /* A ring's page may be one the log marked too */
-                pages.sort_unstable();
-                pages.dedup();
+                pages.finish();
                 round += 1;
                 let at = now_ms();
-                let sent = send_pages(&mut tx, &guest, &runs_of(&mut pages)?, round, work, &mut progress)?;
+                let sent = send_pages(&mut tx, &guest, pages.runs(), round, work, &mut progress)?;
                 trace_round(id, round, &sent, now_ms() - at, 0, 0, true);
                 total.pages += sent.pages;
                 total.zeros += sent.zeros;
@@ -1294,29 +1373,23 @@ fn logcheck(state: &State, guest: &LinuxGuest, rounds: u32, out: &mut dyn Write)
             }
         }
         let mut again = 0u64;
-        let note = |pages: &mut Vec<u64>, lost: &mut bool, gpa: u64| {
-            if pages.try_reserve(1).is_ok() {
-                pages.push(gpa);
-            } else {
-                *lost = true;
-            }
-        };
         for round in 1..=rounds {
             if state.unloading.load(Ordering::Acquire) {
                 return Err(String::from("the module is being unloaded"));
             }
             kcore::task::sleep_ms(LOGCHECK_GAP_MS);
-            let (mut pages, mut lost) = (Vec::new(), false);
-            guest.log_round(&mut |gpa| note(&mut pages, &mut lost, gpa))?;
-            if lost {
+            let mut pages = RoundPages::new();
+            guest.log_round(&mut |gpa| pages.note(gpa))?;
+            if pages.lost {
                 return Err(String::from("out of memory for a round's pages"));
             }
-            for &gpa in &pages {
+            pages.finish();
+            for gpa in pages.pages() {
                 copy.take(guest, gpa, buf)?;
             }
-            again += pages.len() as u64;
+            again += pages.logged.len() as u64;
             let _ = writeln!(out, "hv: round {}: {} pages written since the round before, copied again", round,
-                             pages.len());
+                             pages.logged.len());
         }
         /* The last: paused and drained, the pages written since and the
            rings, as a migration's last round sends them */
@@ -1324,22 +1397,23 @@ fn logcheck(state: &State, guest: &LinuxGuest, rounds: u32, out: &mut dyn Write)
         paused = true;
         let paused_at = now_ms();
         guest.settle().map_err(|e| alloc::format!("its disks not drained: {}", e))?;
-        let (mut pages, mut lost) = (Vec::new(), false);
-        guest.log_last(&mut |gpa| note(&mut pages, &mut lost, gpa));
+        let mut pages = RoundPages::new();
+        guest.log_last(&mut |gpa| pages.note(gpa));
         guest.ring_ranges(&mut |base, len| {
             let mut gpa = base & !(PAGE - 1);
             while gpa < base + len {
-                note(&mut pages, &mut lost, gpa);
+                pages.note_ring(gpa);
                 gpa += PAGE;
             }
         });
-        if lost {
+        if pages.lost {
             return Err(String::from("out of memory for the last round's pages"));
         }
-        pages.sort_unstable();
-        pages.dedup();
-        for &gpa in &pages {
+        pages.finish();
+        let mut last = 0u64;
+        for gpa in pages.pages() {
             copy.take(guest, gpa, buf)?;
+            last += 1;
         }
         /* Then the copy held to the memory, page by page */
         let mut checked = 0u64;
@@ -1364,7 +1438,7 @@ fn logcheck(state: &State, guest: &LinuxGuest, rounds: u32, out: &mut dyn Write)
         }
         Ok(alloc::format!("its dirty log held: {} pages copied as it ran, {} again in {} round{} and {} at the last, \
                            paused {} ms -- every one the same as its memory, in {} ms", checked, again, rounds,
-                          if rounds == 1 { "" } else { "s" }, pages.len(), paused_ms, now_ms() - started))
+                          if rounds == 1 { "" } else { "s" }, last, paused_ms, now_ms() - started))
     })();
     guest.log_stop();
     if paused {
