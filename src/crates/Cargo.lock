@@ -926,6 +926,7 @@ name = "nbstrace"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "nbscs",
  "nbswire",
 ]
 

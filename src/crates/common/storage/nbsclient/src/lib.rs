@@ -2547,13 +2547,40 @@ impl Session {
         self.flush_progress(op, now, bufs, out);
     }
 
-    /// Operation `id` past its deadline before it went: failed, said, and
-    /// nothing of it sent -- a flush failed as one out is, what it would
-    /// have asked dirty still.
+    /// Operation `id` past its deadline before it went: failed, said with
+    /// the session's queue state, and nothing of it sent -- a flush failed
+    /// as one out is, what it would have asked dirty still.
     fn late_unsent(&mut self, id: u64, now: u64, bufs: &mut dyn Buffers, out: &mut Vec<Out>) {
-        let Some(kind) = self.ops.get(&id).map(|o| o.kind) else { return };
-        out.push(Out::Say(alloc::format!("nbs: volume {}: an operation not begun in {} s -- failed", self.name,
-                                         DEADLINE_NS / 1_000_000_000)));
+        let Some((kind, offset, len, started)) = self.ops.get(&id).map(|o| (o.kind, o.offset, o.len, o.started))
+        else { return };
+        let (flying, many) = self.in_flight();
+        let oldest = self.ops.values().map(|o| now.saturating_sub(o.started)).max().unwrap_or(0);
+        out.push(Out::Say(alloc::format!(
+            "nbs: volume {}: #{} {:?} at {}+{} not begun in {} s -- failed: {:?}, {} ops, in flight {} B/{}; age {}, oldest {}",
+            self.name, id, kind, offset, len, DEADLINE_NS / 1_000_000_000, self.phase, self.ops.len(), flying, many,
+            now.saturating_sub(started), oldest)));
+        let waiting: Vec<(u64, bool)> = match kind {
+            Kind::Read => Vec::new(),
+            Kind::Write => self.ops.iter()
+                .filter(|(&other, x)| other < id && x.kind == Kind::Write && overlaps(x.offset, x.len, offset, len))
+                .map(|(&other, x)| (other, x.out)).take(2).collect(),
+            Kind::Flush | Kind::Close => self.ops.iter().filter(|(&other, x)| other < id && x.kind == Kind::Write)
+                .map(|(&other, x)| (other, x.out)).take(2).collect(),
+        };
+        out.push(Out::Say(alloc::format!(
+            "nbs: volume {}: queue {:?}, waiting on {:?}; pieces {:?}, parked {:?}",
+            self.name, self.queue.iter().take(2).collect::<Vec<_>>(), waiting,
+            self.pieces.keys().take(2).collect::<Vec<_>>(), self.parked.iter().take(2).collect::<Vec<_>>())));
+        let requests = self.subs.iter().take(2).map(|(id, s)| {
+            (*id, s.cs, &s.what, now.saturating_sub(s.first), now.saturating_sub(s.sent), s.went, s.chained)
+        }).collect::<Vec<_>>();
+        out.push(Out::Say(alloc::format!("nbs: volume {}: requests {:?}; open {:?}; closing {:?}", self.name, requests,
+                                         self.open.iter().take(2).collect::<Vec<_>>(),
+                                         self.closing.iter().take(2).collect::<Vec<_>>())));
+        out.push(Out::Say(alloc::format!(
+            "nbs: volume {}: stop {:?}/{:?}, mds {:?}; reading {}, mending {}, paused {}", self.name, self.stop,
+            self.stop_flush, self.mds.as_ref().map(|m| m.want), self.reading.is_some(), self.mending.is_some(),
+            self.pausing.is_some())));
         if kind.flushes() {
             if let Some(o) = self.ops.get_mut(&id) {
                 o.out = true;

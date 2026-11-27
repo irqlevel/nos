@@ -23,6 +23,7 @@ mod device;
 mod exec;
 mod format;
 mod store;
+mod trace;
 mod turns;
 
 pub use device::{Device, IoError};
@@ -30,6 +31,7 @@ pub use exec::now;
 pub use format::{device_slots, holds, layout, Decoded, Epoch, Holds, Identity, Layout, Record, SlotState, Super,
                  FENCES_MAX};
 pub use store::{ChunkRef, DeviceInfo, Error, Holding, OpenError, Repairs, Store, PAGE_OF_CHUNKS};
+pub use trace::{NbsCsStepStage, NbsTurnStage, Trace};
 
 /// A chunk's slot: 4 MiB, as the metadata's chunks are.
 pub const SLOT: u64 = (nbsmeta::CHUNK_MIB as u64) << 20;

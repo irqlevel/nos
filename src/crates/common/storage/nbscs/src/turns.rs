@@ -9,9 +9,12 @@
 //! the executor polls again for.
 
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
 use core::future::poll_fn;
 use core::task::Poll;
+
+use crate::trace::{self, NbsTurnStage, Trace};
 
 /// The queues of one kind of key: a chunk's number, a volume's.
 #[derive(Default)]
@@ -19,6 +22,7 @@ pub(crate) struct Turns {
     queues: RefCell<BTreeMap<u32, VecDeque<(u64, bool)>>>,
     next: Cell<u64>,
     released: Cell<u64>,
+    trace: Option<Rc<dyn Trace>>,
 }
 
 /// A turn held, or waited for: let go when dropped.
@@ -26,10 +30,13 @@ pub(crate) struct Turn<'a> {
     turns: &'a Turns,
     key: u32,
     ticket: u64,
+    alone: bool,
+    since: u64,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
+        trace::turn(self.turns.trace.as_ref(), self.ticket, self.key, self.alone, NbsTurnStage::Release, self.since);
         self.turns.released.set(self.turns.released.get().wrapping_add(1));
         let mut q = self.turns.queues.borrow_mut();
         if let Some(waiting) = q.get_mut(&self.key) {
@@ -42,6 +49,10 @@ impl Drop for Turn<'_> {
 }
 
 impl Turns {
+    pub(crate) fn set_tracer(&mut self, tracer: Rc<dyn Trace>) {
+        self.trace = Some(tracer);
+    }
+
     /// Whether `ticket` may go: alone, the first in its queue; shared, with
     /// nobody alone before it.
     fn may_go(&self, key: u32, ticket: u64) -> bool {
@@ -61,10 +72,13 @@ impl Turns {
         let ticket = self.next.get();
         self.next.set(ticket + 1);
         self.queues.borrow_mut().entry(key).or_default().push_back((ticket, alone));
+        let since = trace::turn_since(self.trace.as_ref());
+        trace::turn(self.trace.as_ref(), ticket, key, alone, NbsTurnStage::Wait, 0);
         /* Made first, so that a wait given up -- the future dropped --
            takes its ticket out of the queue */
-        let turn = Turn { turns: self, key, ticket };
+        let turn = Turn { turns: self, key, ticket, alone, since };
         poll_fn(|_| if self.may_go(key, ticket) { Poll::Ready(()) } else { Poll::Pending }).await;
+        trace::turn(self.trace.as_ref(), ticket, key, alone, NbsTurnStage::Acquire, since);
         turn
     }
 

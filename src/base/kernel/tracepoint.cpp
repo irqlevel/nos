@@ -861,6 +861,33 @@ const Field NBS_CS_DONE_FIELDS[] = {
     { "pid", __builtin_offsetof(NbsCsDone, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
 };
 
+static_assert(sizeof(NbsCsStep) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(NbsTurn) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+const char* const NBS_CS_STEP_STAGES[] = { "zero_start", "zero_done", "put_start", "put_done", "write_start",
+                                           "write_done", "flush_start", "flush_done", "commit_start", "commit_done" };
+const char* const NBS_TURN_STAGES[] = { "wait", "acquire", "release" };
+
+const Field NBS_CS_STEP_FIELDS[] = {
+    { "stage", __builtin_offsetof(NbsCsStep, stage), sizeof(u8), Kind::Enum, NBS_CS_STEP_STAGES,
+      sizeof(NBS_CS_STEP_STAGES) / sizeof(NBS_CS_STEP_STAGES[0]) },
+    { "volume", __builtin_offsetof(NbsCsStep, volume), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "chunk", __builtin_offsetof(NbsCsStep, chunk), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "offset", __builtin_offsetof(NbsCsStep, offset), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(NbsCsStep, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ns", __builtin_offsetof(NbsCsStep, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsCsStep, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+const Field NBS_TURN_FIELDS[] = {
+    { "id", __builtin_offsetof(NbsTurn, id), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "stage", __builtin_offsetof(NbsTurn, stage), sizeof(u8), Kind::Enum, NBS_TURN_STAGES,
+      sizeof(NBS_TURN_STAGES) / sizeof(NBS_TURN_STAGES[0]) },
+    { "key", __builtin_offsetof(NbsTurn, key), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "alone", __builtin_offsetof(NbsTurn, alone), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "ns", __builtin_offsetof(NbsTurn, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(NbsTurn, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
 /* ---- raft's events ---- */
 
 static_assert(sizeof(RaftRole) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
@@ -1113,6 +1140,10 @@ const Event EVENTS[] = {
     { "mig_sync", "migrate", "a guest's nested table narrowed by a migration's dirty log, and the wait for its CPUs "
       "to drop what their TLBs kept of it", sizeof(MigSync),
       sizeof(MIG_SYNC_FIELDS) / sizeof(MIG_SYNC_FIELDS[0]), MIG_SYNC_FIELDS },
+    { "nbs_cs_step", "nbs", "a chunk server's storage stage, and how long it took",
+      sizeof(NbsCsStep), sizeof(NBS_CS_STEP_FIELDS) / sizeof(NBS_CS_STEP_FIELDS[0]), NBS_CS_STEP_FIELDS },
+    { "nbs_turn", "nbs", "a turn ticket's wait, acquisition and release",
+      sizeof(NbsTurn), sizeof(NBS_TURN_FIELDS) / sizeof(NBS_TURN_FIELDS[0]), NBS_TURN_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 

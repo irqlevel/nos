@@ -205,8 +205,10 @@ pub fn run(shared: Arc<Shared>) {
         shared.say("its mailbox not named -- another cs on this host?");
         return;
     }
+    let mut store = Store::new();
+    store.set_tracer(Rc::new(nbstrace::Tracer));
     let cs = Rc::new(Cs {
-        shared, mb, store: Store::new(), requests: Requests::new(), moves: Rc::new(Cell::new(0)), next_id: Cell::new(1),
+        shared, mb, store, requests: Requests::new(), moves: Rc::new(Cell::new(0)), next_id: Cell::new(1),
         told: RefCell::new(BTreeMap::new()), copy_answers: RefCell::new(VecDeque::new()), cluster: Cell::new([0; 16]),
         cs: Cell::new(None), taken: RefCell::new(BTreeSet::new()), trouble: RefCell::new(Vec::new()),
         idents: RefCell::new(Vec::new()), serving: Cell::new(false), changed: Cell::new(false),

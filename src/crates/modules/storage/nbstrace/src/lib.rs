@@ -1,7 +1,8 @@
 //! NBS's records (`trace on nbs`, docs/tracing.md): a volume's request as
 //! its client sends it -- `nbs_req`, and back, `nbs_ans`, or bounced,
 //! `nbs_bounce` -- and as a chunk server takes it and answers it,
-//! `nbs_cs_req` and `nbs_cs_done`, each naming it by its session's id.
+//! `nbs_cs_req` and `nbs_cs_done`, each naming it by its session's id;
+//! storage's stages (`nbs_cs_step`) and turns (`nbs_turn`) within it.
 //!
 //! The one place nbswire's requests and answers are said as the kernel's
 //! events' values: what a request asks (`NbsOp`, nbswire's `Op`) and what an
@@ -19,12 +20,20 @@
 
 use kcore::ipc::Bounce;
 use kcore::time::boot_time_ns;
-use kcore::trace::{self, BounceWhy, NbsAns, NbsBounce, NbsCsDone, NbsCsReq, NbsOp, NbsReq, NbsStatus};
+use kcore::trace::{self, BounceWhy, NbsAns, NbsBounce, NbsCsDone, NbsCsReq, NbsCsStep,
+                   NbsCsStepStage as KernelStepStage, NbsOp, NbsReq, NbsStatus, NbsTurn,
+                   NbsTurnStage as KernelTurnStage};
+use nbscs::{NbsCsStepStage, NbsTurnStage};
 use nbswire::{Answer, Op, Refusal, Reply, Request};
 
 /// A count in a record's 32 bits: what is past them said as their most.
 fn u32_of(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+fn elapsed(since: u64) -> u32 {
+    let ns = if since == 0 { 0 } else { boot_time_ns().saturating_sub(since) };
+    u32::try_from(ns).unwrap_or(u32::MAX)
 }
 
 /// What a request asks, of which chunk, where in it and how many bytes --
@@ -201,14 +210,59 @@ pub fn done(from: u16, req: &Request<'_>, reply: &Reply<'_>, since: u64) {
 fn record_done(from: u16, req: &Request<'_>, reply: &Reply<'_>, since: u64) {
     let (op, ..) = op_of(&req.op);
     /* Taken before the event was on: no time to say */
-    let ns = if since == 0 { 0 } else { boot_time_ns().saturating_sub(since) };
     trace::emit(&NbsCsDone {
         id: req.id,
-        ns: u32::try_from(ns).unwrap_or(u32::MAX),
+        ns: elapsed(since),
         pid: trace::pid(),
         from,
         op: op as u8,
         status: status_of(reply) as u8,
         _pad: [0; 4],
     });
+}
+
+/// The chunk server engine's operations, as the kernel's events.
+pub struct Tracer;
+
+impl nbscs::Trace for Tracer {
+    fn now(&self) -> u64 {
+        boot_time_ns()
+    }
+
+    fn step_enabled(&self) -> bool {
+        trace::on::<NbsCsStep>()
+    }
+
+    #[cold]
+    fn step(&self, volume: u32, chunk: u32, offset: u32, len: u32, stage: NbsCsStepStage, since: u64) {
+        let stage = match stage {
+            NbsCsStepStage::ZeroStart => KernelStepStage::ZeroStart,
+            NbsCsStepStage::ZeroDone => KernelStepStage::ZeroDone,
+            NbsCsStepStage::PutStart => KernelStepStage::PutStart,
+            NbsCsStepStage::PutDone => KernelStepStage::PutDone,
+            NbsCsStepStage::WriteStart => KernelStepStage::WriteStart,
+            NbsCsStepStage::WriteDone => KernelStepStage::WriteDone,
+            NbsCsStepStage::FlushStart => KernelStepStage::FlushStart,
+            NbsCsStepStage::FlushDone => KernelStepStage::FlushDone,
+            NbsCsStepStage::CommitStart => KernelStepStage::CommitStart,
+            NbsCsStepStage::CommitDone => KernelStepStage::CommitDone,
+        };
+        trace::emit(&NbsCsStep { volume, chunk, offset, len, ns: elapsed(since), pid: trace::pid(), stage: stage as u8,
+                                 _pad: [0; 3] });
+    }
+
+    fn turn_enabled(&self) -> bool {
+        trace::on::<NbsTurn>()
+    }
+
+    #[cold]
+    fn turn(&self, id: u64, key: u32, alone: bool, stage: NbsTurnStage, since: u64) {
+        let stage = match stage {
+            NbsTurnStage::Wait => KernelTurnStage::Wait,
+            NbsTurnStage::Acquire => KernelTurnStage::Acquire,
+            NbsTurnStage::Release => KernelTurnStage::Release,
+        };
+        trace::emit(&NbsTurn { id, key, alone: u8::from(alone), stage: stage as u8, ns: elapsed(since),
+                               pid: trace::pid(), _pad: [0; 2] });
+    }
 }

@@ -65,8 +65,8 @@ Beside them the host's own: its leader's controller giving up a join
 (`controller:`), the scrub's findings (`scrub:`), its cs's devices and its
 side of each join (`cs:`), and what each client session on the host met --
 a replica asked out, a request refused, an operation failed at its
-deadline (`client:`), these through limiters too. The member replays its
-log as it starts; that is not said again -- but an entry applied before a
+deadline with the queue state and request ages for one that never began
+(`client:`), these through limiters too. The member replays its log as it starts; that is not said again -- but an entry applied before a
 restart and not yet known committed may be said a second time after it.
 
 ```

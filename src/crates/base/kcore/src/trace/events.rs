@@ -543,6 +543,27 @@ names! {
         NotTheJoiner = "not_the_joiner",
     }
 
+    /// A chunk server's storage operation's stage (`nbs_cs_step`).
+    NbsCsStepStage {
+        ZeroStart = "zero_start",
+        ZeroDone = "zero_done",
+        PutStart = "put_start",
+        PutDone = "put_done",
+        WriteStart = "write_start",
+        WriteDone = "write_done",
+        FlushStart = "flush_start",
+        FlushDone = "flush_done",
+        CommitStart = "commit_start",
+        CommitDone = "commit_done",
+    }
+
+    /// A turn ticket's stage (`nbs_turn`).
+    NbsTurnStage {
+        Wait = "wait",
+        Acquire = "acquire",
+        Release = "release",
+    }
+
     /// Why a message came back to its sender (`nbs_bounce`'s `why`): ipc's
     /// `Bounce`
     BounceWhy {
@@ -1149,5 +1170,28 @@ events! {
         cpus: u16,
         what: u8 as MigSyncWhat,
         _pad: u8,
+    }
+
+    /// `nbs_cs_step`: a chunk server's storage operation's stage
+    NbsCsStep = 59, "nbs_cs_step" {
+        volume: u32,
+        chunk: u32,
+        offset: u32,
+        len: u32,
+        ns: u32,
+        pid: u32,
+        stage: u8 as NbsCsStepStage,
+        _pad: [u8; 3],
+    }
+
+    /// `nbs_turn`: a turn ticket's wait, acquisition and release
+    NbsTurn = 60, "nbs_turn" {
+        id: u64,
+        key: u32,
+        ns: u32,
+        pid: u32,
+        alone: u8,
+        stage: u8 as NbsTurnStage,
+        _pad: [u8; 2],
     }
 }

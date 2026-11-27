@@ -840,10 +840,12 @@ alone is one record.
 A volume's request from its client to a chunk server and back, group `nbs`
 ([NBS](nbs.md)). The client is a volume's session, driven by `nbsdrive` --
 a VM's `nbs:` disk in hv, `nbs io`, nbsload -- and the chunk server
-`nbs-cs`; both make their records through `modules/storage/nbstrace`, the
-one place nbswire's requests and answers are said as these events' values.
-Every record names a request by its session's `id`, which ipcnet's records
-of its message carry too (`reference`):
+`nbs-cs`; requests and answers make their records through
+`modules/storage/nbstrace`, the one place nbswire's requests and answers are
+said as these events' values. The engine reports its storage stages and turns
+through the tracer `nbs-cs` installs from `nbstrace`. Requests and answers name
+a request by its session's `id`, which ipcnet's records of its message carry
+too (`reference`); the engine's own records carry its volume/chunk or turn key:
 
 | event | where, and what it records |
 |---|---|
@@ -852,6 +854,8 @@ of its message carry too (`reference`):
 | `nbs_bounce` | a request that never reached its chunk server: refused at the send -- no such mailbox or way, `gone`; the way `full` -- or bounced back by the channel (`unsent`) |
 | `nbs_cs_req` | a request a chunk server took (`serve.rs`'s `request`), as `nbs_req` says one, and the host it came `from` |
 | `nbs_cs_done` | its answer there: what it says, and how long it took from the taking (`ns`) -- the engine's turns, its device's commands, its mds's checks |
+| `nbs_cs_step` | a storage operation's stage (`zero_start`/`zero_done`, `put_start`/`put_done`, `write_start`/`write_done`, `flush_start`/`flush_done`, `commit_start`/`commit_done`), its `volume`, `chunk`, `offset`, `len` and `ns` |
+| `nbs_turn` | a turn ticket's `wait`, `acquire` or `release`: its `id`, the `key` it is a turn on, `alone` or shared, and `ns` |
 
 So where a request's time goes is in its records: from `nbs_req` to
 `nbs_cs_req` the client's host and the channel -- `ipcnet_queue` of the
