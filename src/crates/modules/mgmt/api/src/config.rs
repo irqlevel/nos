@@ -177,6 +177,33 @@ pub fn parse(text: &str) -> Result<Config, String> {
     Ok(reader.c)
 }
 
+/// api.toml's text with `nic` among the interfaces listened on: its `listen`
+/// with it added, every other line as it was. None where it is there already.
+pub fn listening(text: &str, nic: &str) -> Result<Option<String>, String> {
+    if !nic_name(nic) {
+        return Err(alloc::format!("{} is not an interface's name", nic));
+    }
+    let config = parse(text)?;
+    if config.listen.iter().any(|n| n == nic) {
+        return Ok(None);
+    }
+    if config.listen.len() == LISTEN_MAX {
+        return Err(alloc::format!("listen has {} interfaces, all there may be", LISTEN_MAX));
+    }
+    let mut names = config.listen.clone();
+    names.push(nic.to_string());
+    let mut line = String::from("listen = [");
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        conf::quoted(&mut line, name);
+    }
+    line.push_str("]\n");
+    let mut reader = Reader { c: Config::defaults(), texts: Vec::new() };
+    conf::edit(text, "api.toml", &mut reader, &[conf::Edit { key: "listen", line: Some(line) }]).map(Some)
+}
+
 /// api.toml's text with the address `ip` let in on `nic`: its
 /// `allow_<nic>` with the address added -- or made, with it alone, where the
 /// file has none, which lets nothing else in on `nic` from then on -- and

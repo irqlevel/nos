@@ -198,15 +198,17 @@
       "kind": "action",
       "title": {"en": "Add a device", "ru": "Добавить устройство"},
       "help": {
-        "en": "A device of this host's given to its chunk server, by its id (part:... or disk:...) or its name; the Block page lists them.",
-        "ru": "Устройство этого хоста отдаётся его серверу чанков, по id (part:... или disk:...) или имени; их список на странице блочных устройств."
+        "en": "A device of this host's given to its chunk server, by its id (part:... or disk:...) or its name. The choices are the host's devices nothing holds; what has data on it takes wipe.",
+        "ru": "Устройство этого хоста отдаётся его серверу чанков, по id (part:... или disk:...) или имени. В списке — устройства хоста, которые ничто не держит; если на устройстве есть данные, нужна очистка."
       },
       "confirm": {
         "en": "With wipe, whatever is on the device is lost.",
         "ru": "С очисткой всё, что лежит на устройстве, будет потеряно."
       },
       "params": {
-        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"}},
+        "device": {"type": "string", "required": true, "title": {"en": "Device", "ru": "Устройство"},
+          "choices": {"provider": "vm", "method": "devices", "items": "devices", "key": "id",
+            "require": {"in_use_by": null, "boots_the_machine": null}, "show": ["name", "size_bytes", "holds"]}},
         "wipe": {
           "type": "bool", "title": {"en": "Wipe", "ru": "Очистить"},
           "help": {

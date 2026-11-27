@@ -1080,6 +1080,13 @@ const actions = {
    * it: refused where something holds it, or something not NBS's is on it
    * and wipe is not said. */
   'nbs.device_add': (p) => {
+    /* A host added on another mock accepts the offer by its first device:
+     * there is no shared process to change this one's nbs.member. */
+    if (!nbs.member && cluster.member) {
+      nbs.member = true;
+      nbs.name = cluster.name;
+      nbs.hosts = [{ host: me.name, member: nbs.nextMember++, vote: 'voter', leader: false }];
+    }
     nbsMember();
     const word = need(p, 'device');
     const d = DEVICES.find((x) => x.id === word || x.name === word || 'dev:' + x.name === word);
@@ -1410,8 +1417,10 @@ const jobMethods = {
       throw new Refused('failed', host + ' is a member already', 'host');
     }
     return job('nbs', 'host_add', 2, (i) => [host + ' offered the NBS cluster', host + ' took the offer'][i], () => {
-      /* The offer reaches a host of the registry's, its mds there */
-      if (!clusterHost(host)) {
+      /* The offer reaches a host of the registry's, its mds there. A fresh
+       * mock has no other process to take its join: its open invitation is
+       * the host's part of that. */
+      if (!clusterHost(host) && !cluster.invitations.some((i) => i.host === host)) {
         throw new Refused('failed', 'the offer to ' + host + ' stopped: ' + host + ' out of reach: no route -- is it a '
           + 'host of the cluster registry, with nbs-mds loaded?');
       }

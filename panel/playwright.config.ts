@@ -8,9 +8,15 @@ import { defineConfig, devices } from '@playwright/test';
  * yet (--fresh), for the panel to make its registry and its NBS. */
 const MOCK = 39298;
 export const MOCK_B = 39299;
+export const MOCK_C = 39297;
+export const MOCK_D = 39296;
+export const MOCK_E = 39295;
 const PANEL = 3101;
 const STATE = 'test-results/mock-state';
 export const STATE_B = 'test-results/mock-state-b';
+export const STATE_C = 'test-results/mock-state-c';
+export const STATE_D = 'test-results/mock-state-d';
+export const STATE_E = 'test-results/mock-state-e';
 export const PASSWORD = 'playwright-only-password';
 /** The panel's version, as the environment says it to the panel run here. */
 export const PANEL_VERSION = 'pw-panel-1';
@@ -33,6 +39,24 @@ export default defineConfig({
       command: `until [ -f ${STATE}/admin.crt ]; do sleep 0.2; done; `
         + `node mock/server.mjs --port ${MOCK_B} --state ${STATE_B} --name nos-b --trust ${STATE}/admin.crt --fresh`,
       port: MOCK_B,
+      reuseExistingServer: false,
+    },
+    {
+      command: `until [ -f ${STATE}/admin.crt ]; do sleep 0.2; done; `
+        + `node mock/server.mjs --port ${MOCK_C} --state ${STATE_C} --name node-c --trust ${STATE}/admin.crt --fresh`,
+      port: MOCK_C,
+      reuseExistingServer: false,
+    },
+    {
+      command: `until [ -f ${STATE}/admin.crt ]; do sleep 0.2; done; `
+        + `node mock/server.mjs --port ${MOCK_D} --state ${STATE_D} --name node-d --trust ${STATE}/admin.crt --fresh`,
+      port: MOCK_D,
+      reuseExistingServer: false,
+    },
+    {
+      command: `until [ -f ${STATE}/admin.crt ]; do sleep 0.2; done; `
+        + `node mock/server.mjs --port ${MOCK_E} --state ${STATE_E} --name node-e --trust ${STATE}/admin.crt --fresh`,
+      port: MOCK_E,
       reuseExistingServer: false,
     },
     {

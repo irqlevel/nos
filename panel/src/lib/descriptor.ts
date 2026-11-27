@@ -24,13 +24,17 @@ export function worst(a: Tone, b: Tone): Tone {
 
 /** Where a parameter's values come from (the format's `choices`): a read of
  * a provider's on the same host -- `items` the list in its answer, `key`
- * each item's value. A form offers them as a list; a value not among them
- * is the host's to refuse, and a read that fails leaves the field typed. */
+ * each item's value. `require` keeps only items whose fields have those exact
+ * values; `show` adds fields to the option's label. A form offers them as a
+ * list; a value not among them is the host's to refuse, and a read that fails
+ * leaves the field typed. */
 export interface Choices {
   provider: string;
   method: string;
   items: string;
   key: string;
+  require?: Record<string, string | number | boolean | null>;
+  show?: string[];
 }
 
 export interface Field {

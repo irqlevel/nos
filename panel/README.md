@@ -80,7 +80,16 @@ cluster of three and of an NBS cluster of them.
 
 The panel manages every host added on its Hosts page by its API's address
 and key, each its own dashboard, pages and history; the panel is one client
-of all of them, by the key its seed gave it. On a host to add:
+of all of them, by the key its seed gave it. **Connect a host with one
+command** makes a one-time token and the `api enroll` command to run on the
+new host. It lets the panel's key in, restricts the API's allowlist to the
+panel host's address, and calls the panel back over pinned TLS; the host then
+appears in the list, and the token cannot be used again. **Set up cluster and
+NBS** initializes the registry and NBS on selected hosts, joins the others
+and adds the devices chosen from each host's own list, with an explicit wipe
+confirmation where a device holds data.
+
+The manual alternative on a host to add:
 
 ```
 api client add panel-3fe5cf7a admin 3fe5cf7a...   # what the Hosts page prints: the panel's key
@@ -103,8 +112,10 @@ VM made, cloned and deleted as jobs -- its name typed again before it goes,
 a job's log said once and nothing asked of it once it is done -- a
 protected one's delete refused, a console typed at, a second host
 added and reached by the panel's key while one showing another key is not,
-added again once taken away -- its connections of then closed with it --
-and a cluster and an NBS cluster made there, a device given to its chunk
+added again once taken away -- its connections of then closed with it -- an
+enrollment token used once, three fresh hosts taken through the cluster/NBS
+setup wizard, devices offered by what may use them and wiped only when
+confirmed, and a cluster and an NBS cluster made there, a device given to its chunk
 server and drained; NBS's members removed, added and replaced as jobs; VMs
 made of an image of NBS's and poured onto a volume of it; a local image
 selected from `/images` and made a VM without a download; an image of a URL,
