@@ -13,4 +13,5 @@ name = "nbstrace"
 
 [dependencies]
 kcore = { path = "../../../base/kcore" }
+nbscs = { path = "../../../common/storage/nbscs" }
 nbswire = { path = "../../../common/storage/nbswire" }

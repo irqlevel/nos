@@ -783,6 +783,14 @@ def main():
         check("and answered there ok, with their time (nbs_cs_done)",
               any(re.search(r"nbs_cs_done: id=%s op=\w+ from=\d+ status=ok ns=" % i, done) for i in writes),
               done[-2000:])
+        steps = "\n".join(x.run("trace show 400 nbs_cs_step") for x in sh)
+        stages = ("zero_start", "zero_done", "put_start", "put_done", "write_start", "write_done",
+                  "flush_start", "flush_done", "commit_start", "commit_done")
+        check("the first write's zeroing, metadata commit, data and flush recorded inside the cs (nbs_cs_step)",
+              all("stage=" + stage in steps for stage in stages), steps[-4000:])
+        turns = "\n".join(x.run("trace show 400 nbs_turn") for x in sh)
+        check("the chunk's and volume's turns recorded from their wait to their release (nbs_turn)",
+              all("stage=" + stage in turns for stage in ("wait", "acquire", "release")), turns[-2000:])
         queued = a.run("trace show 400 ipcnet_queue")
         check("a's requests queued for a peer by ipcnet under their ids (ipcnet_queue's reference)",
               any(re.search(r"ipcnet_queue: peer=\d+ bulk=\d reference=%s " % i, queued) for i in writes | flushes),

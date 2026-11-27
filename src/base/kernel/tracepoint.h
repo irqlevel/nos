@@ -156,6 +156,9 @@ enum class Id : u16
     MigEnd,
     MigRecv,
     MigSync,
+    /* A chunk server's storage stage or a turn's wait (group "nbs"). */
+    NbsCsStep,
+    NbsTurn,
 
     Count
 };
@@ -1096,6 +1099,31 @@ struct NbsCsDone
     u8 op;
     u8 status;
     u8 pad[4];
+};
+
+/* nbs_cs_step: a storage operation's stage and how long it took */
+struct NbsCsStep
+{
+    u32 volume;
+    u32 chunk;
+    u32 offset;
+    u32 len;
+    u32 ns;
+    u32 pid;
+    u8 stage;
+    u8 pad[3];
+};
+
+/* nbs_turn: a turn ticket's wait, acquisition and release */
+struct NbsTurn
+{
+    u64 id;
+    u32 key;
+    u32 ns;
+    u32 pid;
+    u8 alone;
+    u8 stage;
+    u8 pad[2];
 };
 
 /* raft_role: a member's role, term or leader changed -- which raft it is

@@ -384,6 +384,8 @@ struct OntoVolume<'a> {
     buf: Vec<u8>,
     run: u64,
     out: usize,
+    /// When next to feed answers and keep the session's time while converting.
+    poll_at: u64,
     failed: bool,
     /// A write was handed to the session: the volume holds part of the
     /// image.
@@ -395,6 +397,18 @@ struct OntoVolume<'a> {
 
 #[cfg(target_arch = "x86_64")]
 impl OntoVolume<'_> {
+    /// Conversion can spend its CPU in inflate or skip zero buffers for a
+    /// long time: answers and the session's clock still need their turns.
+    fn poll(&mut self) {
+        let now = kcore::time::boot_time_ns();
+        if now < self.poll_at {
+            return;
+        }
+        self.poll_at = now.saturating_add(nbsdrive::TURN_NS);
+        self.d.turn(0);
+        self.reap(false);
+    }
+
     /// The writes the session is done with taken: waiting while as many as
     /// it may have are out, with `wait`.
     fn reap(&mut self, wait: bool) {
@@ -436,6 +450,7 @@ impl OntoVolume<'_> {
             if self.stopped.get() || self.failed {
                 return Err(kcore::error::Error::IoError);
             }
+            self.poll();
             if self.buf.is_empty() {
                 self.run = self.at;
             }
@@ -697,7 +712,7 @@ pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -
     let started = kcore::time::boot_time_ns();
     let stopped = Cell::new(false);
     let (poured, wrote) = {
-        let mut onto = OntoVolume { d: &mut d, size: disk, at: 0, buf: first, run: 0, out: 0, failed: false,
+        let mut onto = OntoVolume { d: &mut d, size: disk, at: 0, buf: first, run: 0, out: 0, poll_at: 0, failed: false,
                                     wrote: false, fresh, stopped: &stopped };
         let mut reported = started;
         let mut progress = |at: u64| {

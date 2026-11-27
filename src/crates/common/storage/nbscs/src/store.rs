@@ -68,6 +68,7 @@ use nbsmeta::Pieces;
 
 use crate::device::{Device, IoError};
 use crate::format::*;
+use crate::trace::{self, NbsCsStepStage, Trace};
 use crate::turns::Turns;
 use crate::{COPY_PIECE, GRANULE, PAGE, SECTOR, SLOT};
 
@@ -189,6 +190,7 @@ struct Dev<D> {
     d: D,
     layout: Layout,
     sup: Super,
+    trace: Option<Rc<dyn Trace>>,
     st: RefCell<DevState>,
 }
 
@@ -210,9 +212,11 @@ struct DevState {
 }
 
 impl<D> Dev<D> {
-    fn new(d: D, layout: Layout, sup: Super, records: Pieces<Record>, free: Pieces<u32>, lost: u32) -> Dev<D> {
-        Dev { d, layout, sup, st: RefCell::new(DevState { records, free, lost, writes: 0, flushed: 0, flushing: None,
-                                                          ended: 0, failed: false, active: true }) }
+    fn new(d: D, layout: Layout, sup: Super, records: Pieces<Record>, free: Pieces<u32>, lost: u32,
+           trace: Option<Rc<dyn Trace>>) -> Dev<D> {
+        Dev { d, layout, sup, trace,
+              st: RefCell::new(DevState { records, free, lost, writes: 0, flushed: 0, flushing: None, ended: 0,
+                                          failed: false, active: true }) }
     }
 
     fn record(&self, slot: u32) -> Record {
@@ -308,6 +312,8 @@ impl<D: Device> Dev<D> {
     /// flight that began after them waited for, or one begun now -- after
     /// the one in flight, where that began before them.
     async fn durable(&self) -> Result<(), IoError> {
+        let since = trace::step_since(self.trace.as_ref());
+        trace::step(self.trace.as_ref(), 0, 0, 0, 0, NbsCsStepStage::FlushStart, 0);
         let need = self.st.borrow().writes;
         loop {
             let flushing = {
@@ -316,6 +322,7 @@ impl<D: Device> Dev<D> {
                     return Err(IoError);
                 }
                 if st.flushed >= need {
+                    trace::step(self.trace.as_ref(), 0, 0, 0, 0, NbsCsStepStage::FlushDone, since);
                     return Ok(());
                 }
                 st.flushing
@@ -425,6 +432,7 @@ pub struct Store<D: Device> {
     chunk_turns: Turns,
     volume_turns: Turns,
     commits: RefCell<Commits>,
+    trace: Option<Rc<dyn Trace>>,
 }
 
 /// The records and fences on their way to the devices: the pages marked
@@ -579,7 +587,15 @@ impl<D: Device> Store<D> {
             volume_turns: Turns::default(),
             commits: RefCell::new(Commits { table: BTreeMap::new(), fences: BTreeSet::new(), next: 1, done: 0,
                                             running: false, ended: 0 }),
+            trace: None,
         }
+    }
+
+    /// Tracing for the store, its turns and devices taken in after this call.
+    pub fn set_tracer(&mut self, tracer: Rc<dyn Trace>) {
+        self.chunk_turns.set_tracer(tracer.clone());
+        self.volume_turns.set_tracer(tracer.clone());
+        self.trace = Some(tracer);
     }
 
     /// Turns held or waited for, and rounds running: none once every
@@ -635,6 +651,8 @@ impl<D: Device> Store<D> {
     /// it began, each device flushed; then copy B, flushed. A device whose
     /// write or flush fails is taken as failed.
     async fn commit_round(&self) {
+        let since = trace::step_since(self.trace.as_ref());
+        trace::step(self.trace.as_ref(), 0, 0, 0, 0, NbsCsStepStage::CommitStart, 0);
         let mut round = {
             let mut c = self.commits.borrow_mut();
             c.running = true;
@@ -667,6 +685,7 @@ impl<D: Device> Store<D> {
             }
         }
         round.finished = true;
+        trace::step(self.trace.as_ref(), 0, 0, 0, 0, NbsCsStepStage::CommitDone, since);
     }
 
     /// Device `dv`.
@@ -716,7 +735,7 @@ impl<D: Device> Store<D> {
         for s in (0..layout.slots).rev() {
             free.push(s);
         }
-        let dev = Dev::new(d, layout, sup, records, free, 0);
+        let dev = Dev::new(d, layout, sup, records, free, 0, self.trace.clone());
         /* The cs's fences onto it, then the superblock: A, then B */
         let fences = self.s.borrow().fences.clone();
         let mut ok = true;
@@ -878,7 +897,7 @@ impl<D: Device> Store<D> {
                 free.push(s);
             }
         }
-        let dev = Dev::new(d, layout, sup, records, free, lost);
+        let dev = Dev::new(d, layout, sup, records, free, lost, self.trace.clone());
         /* The stale copies made the good ones again, a copy at a time -- the
            superblock's too, A then B -- while no request of the cs's can
            reach the device */
@@ -1089,6 +1108,8 @@ impl<D: Device> Store<D> {
     /// Slot `slot` of device `dv` holding `r`, its page durable by the
     /// round that takes it -- copy A of it written, flushed, then copy B.
     async fn put(&self, dv: usize, slot: u32, r: Record) -> Result<(), Error> {
+        let since = trace::step_since(self.trace.as_ref());
+        trace::step(self.trace.as_ref(), r.volume, r.chunk, slot, 0, NbsCsStepStage::PutStart, 0);
         /* Written again in this run: no longer as it was found -- the chunk
            the slot held, and the one it holds now -- where this slot is the
            one the chunk is held in: a stale copy of a chunk released, or a
@@ -1115,6 +1136,7 @@ impl<D: Device> Store<D> {
             c.next
         };
         self.committed(round).await;
+        trace::step(self.trace.as_ref(), r.volume, r.chunk, slot, 0, NbsCsStepStage::PutDone, since);
         if dev.failed() {
             return Err(Error::Io);
         }
@@ -1234,10 +1256,15 @@ impl<D: Device> Store<D> {
         self.mark(&c, offset, data.len())?;
         let joins = self.joins_begun(c.epoch.set);
         let dev = self.dev(dv);
+        let since = trace::step_since(self.trace.as_ref());
+        trace::step(self.trace.as_ref(), volume, c.chunk, offset, u32::try_from(data.len()).unwrap_or(u32::MAX),
+                    NbsCsStepStage::WriteStart, 0);
         if dev.write_data(dev.data_at(slot, u64::from(offset)), data).await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
+        trace::step(self.trace.as_ref(), volume, c.chunk, offset, u32::try_from(data.len()).unwrap_or(u32::MAX),
+                    NbsCsStepStage::WriteDone, since);
         Ok(joins)
     }
 
@@ -1265,10 +1292,15 @@ impl<D: Device> Store<D> {
            record kept with its zeros lost would read what the slot held
            through this chunk -- another volume's data. (Found by tests/fuzz/nbs's
            cs target.) */
+        let since = trace::step_since(self.trace.as_ref());
+        trace::step(self.trace.as_ref(), volume, c.chunk, offset, u32::try_from(len).unwrap_or(u32::MAX),
+                    NbsCsStepStage::ZeroStart, 0);
         if dev.zero_data(dev.data_at(slot, 0), SLOT).await.is_err() || dev.durable().await.is_err() {
             dev.fail();
             return Err(Error::Io);
         }
+        trace::step(self.trace.as_ref(), volume, c.chunk, offset, u32::try_from(len).unwrap_or(u32::MAX),
+                    NbsCsStepStage::ZeroDone, since);
         held.slot = None;
         let old = self.record(dv, slot);
         let open = Record { state: SlotState::Open, chunk: c.chunk, incarnation: c.incarnation, known: c.epoch,
