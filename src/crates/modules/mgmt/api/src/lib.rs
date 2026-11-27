@@ -23,6 +23,7 @@
 extern crate alloc;
 
 mod config;
+mod enroll;
 mod files;
 mod http;
 mod panel;
@@ -45,7 +46,7 @@ use files::{Client, Dir, Role};
 use http::Ip;
 use server::{Counters, Listening, Locked, Phase, Server, Shared};
 
-const HELP: &str = "api [start | stop | clients | client add|del | reload | cert | panel] - the host API";
+const HELP: &str = "api [start | stop | clients | client add|del | reload | cert | enroll | panel] - the host API";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: api                         what it serves, and to whom\n\
@@ -56,6 +57,8 @@ const USAGE: &str = "usage: api                         what it serves, and to w
                      \x20      api client del <name>\n\
                      \x20      api reload                  the clients file and api.toml's allowlists read again\n\
                      \x20      api cert                    the host's certificate, and its key's fingerprint\n\
+                     \x20      api enroll <panel-ip:port> <panel-key> <token> <name> [nic=eth0]\n\
+                     \x20                                  the host added to the panel, by one command\n\
                      \x20      api panel                   the management panel's VM, and where it is\n\
                      \x20      api panel create [image=<url>] [bundle=<url> sha256=<hex>] [port=<n>] [memory=<MiB>]\n\
                      \x20                                  the panel made, and started (at every boot: /etc/rc)";
@@ -283,6 +286,7 @@ fn run(state: &State, args: &str, out: &mut Output) -> Result<(), String> {
         },
         Some("reload") => reload(state, out),
         Some("cert") => cert(state, out),
+        Some("enroll") => enroll::run(state, words, out),
         Some("panel") => panel::run(state, words, out),
         Some(other) => Err(alloc::format!("what is '{}'?\n{}", other, USAGE)),
     }

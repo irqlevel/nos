@@ -4,9 +4,10 @@ import path from 'node:path';
 
 import { expect, Page, test } from '@playwright/test';
 
-import { MOCK_B, PANEL_VERSION, PASSWORD, STATE_B } from '../playwright.config';
+import { MOCK_B, MOCK_C, MOCK_D, MOCK_E, PANEL_VERSION, PASSWORD, STATE_B, STATE_C, STATE_D, STATE_E } from '../playwright.config';
 import { addressFor, copyable, ipOfUrl, isPublic } from '../src/lib/fills';
 import { pastLimitWhy } from '../src/lib/nosapi';
+import { Candidate, validateSetup } from '../src/lib/setup';
 
 async function login(page: Page, locale = 'en') {
   await page.goto(`/${locale}/login`);
@@ -704,7 +705,7 @@ test('a cluster: a second host added by its address and its key, the panel let i
 
   /* A host that shows a key other than the one given is not reached, and
    * says why */
-  const form = page.locator('form');
+  const form = page.locator('form:has(input[name=pin])');
   const pinB = pinOf(STATE_B);
   const wrong = pinB.replace(/^./, (c) => (c === '0' ? '1' : '0'));
   await form.locator('input[name=name]').fill('wrong');
@@ -808,7 +809,7 @@ test('the address an invitation is filled in with: a public one first, the host\
  * online and its page open. */
 async function addHost(page: Page, name: string, port: number, state: string): Promise<string> {
   await page.goto('/en/hosts');
-  const form = page.locator('form');
+  const form = page.locator('form:has(input[name=pin])');
   await form.locator('input[name=name]').fill(name);
   await form.locator('input[name=url]').fill(`127.0.0.1:${port}`);
   await form.locator('input[name=pin]').fill(pinOf(state));
@@ -882,7 +883,11 @@ test('a host of no cluster: its registry made, then its NBS, a device given to i
    * confirm asked each time */
   await page.getByRole('button', { name: /^Add a device/ }).click();
   const add = page.getByTestId('form-nbs-device_add');
-  await add.locator('input[name=device]').fill('nvme17');
+  const deviceChoices = add.locator('select[name=device]');
+  await expect(deviceChoices.locator('option')).toContainText([/nvme16/, /nvme17/, /sda/]);
+  await expect(deviceChoices.locator('option', { hasText: /nvme0 |nvme01|nvme02/ })).toHaveCount(0);
+  await expect(deviceChoices.locator('option', { hasText: /nvme17/ })).toContainText(['an ext4 filesystem']);
+  await deviceChoices.selectOption('part:704db7dd-0007-4e69-94e6-46e271b44854');
   await add.getByRole('button', { name: 'Add a device' }).click();
   await add.getByRole('button', { name: 'Confirm' }).click();
   await expect(add).toContainText("not NBS's");
@@ -1224,3 +1229,74 @@ test('a table\'s values keep to one line in a narrow window: the table scrolls i
   expect(tall).toEqual([]);
 });
 
+
+
+test('enrollment: one command, its callback adds the host once, the token cannot be used again', async ({ page }) => {
+  await login(page);
+  await page.goto('/en/hosts');
+  const form = page.getByTestId('enroll-form');
+  await form.locator('input[name=enroll_name]').fill('nos-b');
+  await form.locator('input[name=panel_address]').fill('127.0.0.1:39233');
+  await form.getByRole('button', { name: 'Make the enrollment command' }).click();
+  const command = await page.getByTestId('enroll-command').textContent();
+  expect(command).toMatch(/api enroll 127\.0\.0\.1:39233 [0-9a-f]{64} [0-9a-f]{64} nos-b nic=eth0/);
+  const token = command?.match(/([0-9a-f]{64}) nos-b nic=eth0/)?.[1];
+  expect(token).toBeTruthy();
+  const pin = pinOf(STATE_B);
+  const callback = `/api/enroll?token=${token}&name=nos-b&url=${encodeURIComponent(`127.0.0.1:${MOCK_B}`)}&pin=${pin}`;
+  const added = await page.request.get(callback);
+  expect(added.status()).toBe(200);
+  await expect(page.getByTestId('host-nos-b')).toContainText('online', { timeout: 20_000 });
+  expect((await page.request.get(callback)).status()).toBe(403);
+  await removeHost(page, 'nos-b');
+});
+
+test('cluster setup: three fresh hosts join, NBS is made and each device is chosen, one wiped only when confirmed', async ({ page }) => {
+  await login(page);
+  await addHost(page, 'node-c', MOCK_C, STATE_C);
+  await addHost(page, 'node-d', MOCK_D, STATE_D);
+  await addHost(page, 'node-e', MOCK_E, STATE_E);
+  await page.goto('/en/hosts');
+  const setup = page.getByTestId('cluster-setup');
+  await setup.getByLabel('Use mock', { exact: true }).uncheck();
+  await setup.getByLabel('First host node-c', { exact: true }).check();
+  await setup.locator('input[name=cluster_name]').fill('test');
+  await setup.locator('input[name=nbs_name]').fill('store');
+  await setup.getByRole('button', { name: 'Review the setup' }).click();
+  await expect(setup.getByTestId('setup-node-c')).toBeVisible();
+  await expect(setup.getByTestId('setup-node-d')).toBeVisible();
+  await expect(setup.getByTestId('setup-node-e')).toBeVisible();
+  const choices = setup.locator('select[name=device-node-d]');
+  await expect(choices.locator('option')).toContainText([/nvme16/, /nvme17/, /sda/]);
+  await expect(choices.locator('option', { hasText: /nvme0 |nvme01|nvme02/ })).toHaveCount(0);
+  await choices.selectOption('part:704db7dd-0007-4e69-94e6-46e271b44854');
+  await setup.getByTestId('setup-node-d').getByRole('checkbox').check();
+  await setup.getByRole('checkbox', { name: /everything on devices marked wipe/ }).check();
+  await setup.getByRole('button', { name: 'Create cluster and add devices' }).click();
+  await expect(setup.getByTestId('setup-done')).toBeVisible({ timeout: 45_000 });
+  await expect(setup.getByTestId('setup-log')).toContainText('cluster.init test');
+  await expect(setup.getByTestId('setup-log')).toContainText('cluster.invite node-d');
+  await expect(setup.getByTestId('setup-log')).toContainText('cluster.invite node-e');
+  await expect(setup.getByTestId('setup-log')).toContainText('nbs.init store');
+  await expect(setup.getByTestId('setup-log')).toContainText('nbs.host_add node-d');
+  await expect(setup.getByTestId('setup-log')).toContainText('nbs.device_add part:704db7dd-0007');
+});
+
+
+test('cluster setup preflight never makes a new group beside an existing member', () => {
+  const candidate = (name: string, member: boolean, nbsMember = false): Candidate => ({
+    host: { id: name, name, url: `${name}:39234`, online: true },
+    cluster: { member, cluster: member ? 'test' : null, stopped: null,
+      this_host: { name, key: name.padStart(64, '0'), ip: '10.0.0.1', port: null, serving: true } },
+    nbs: { member: nbsMember, cluster: nbsMember ? 'store' : null, stopped: null },
+    devices: [{ name: 'nos-data', id: 'part:' + name, size_bytes: 1024, holds: null, in_use_by: null,
+      boots_the_machine: null }],
+  });
+  const candidates = [candidate('a', false), candidate('b', true), candidate('c', false)];
+  const devices = Object.fromEntries(candidates.map((c) => [c.host.id, { id: 'part:' + c.host.name, wipe: false }]));
+  expect(() => validateSetup({ candidates, leaderId: 'a', clusterName: 'test', nbsName: 'store', devices }))
+    .toThrow(/choose an existing member first/);
+  const nbsCandidates = [candidate('a', true), candidate('b', true, true), candidate('c', true)];
+  expect(() => validateSetup({ candidates: nbsCandidates, leaderId: 'a', clusterName: 'test', nbsName: 'store', devices }))
+    .toThrow(/choose an existing member first/);
+});

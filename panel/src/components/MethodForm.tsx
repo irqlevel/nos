@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 import { CopyButton } from './CopyButton';
 import { JobWatch } from './JobWatch';
 import { call, JobRecord, Refusal, startJob } from '@/lib/client';
-import { Choices, Field, Method } from '@/lib/descriptor';
+import { bytes, Choices, Field, Method } from '@/lib/descriptor';
 import { addressFor, at, copyable, fillOf, ipOfUrl } from '@/lib/fills';
 import { Locale, text, Words } from '@/lib/i18n';
 
@@ -71,7 +71,7 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   /* What a parameter with `choices` is offered: each item's key in its
    * read's answer -- none until it answers, nor where it fails, and the
    * field is typed then. */
-  const [offered, setOffered] = useState<Record<string, string[]>>({});
+  const [offered, setOffered] = useState<Record<string, Array<{ value: string; label: string }>>>({});
   const wanted = JSON.stringify(params.filter(([, f]) => f.choices).map(([k, f]) => [k, f.choices]));
   const [others, setOthers] = useState<Other[]>([]);
   const [filledFrom, setFilledFrom] = useState('');
@@ -94,8 +94,21 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
       void call(host, c.provider, c.method).then((r) => {
         const items = r.ok ? (r.data as Record<string, unknown>)[c.items] : null;
         if (!live || !Array.isArray(items)) return;
-        const keys = items.map((it) => (it as Record<string, unknown> | null)?.[c.key])
-          .filter((v) => typeof v === 'string' || typeof v === 'number').map(String);
+        const keys = items.filter((it) => {
+          const row = it as Record<string, unknown> | null;
+          return row && Object.entries(c.require ?? {}).every(([field, want]) => row[field] === want);
+        }).flatMap((it) => {
+          const row = it as Record<string, unknown>;
+          const value = row[c.key];
+          if (typeof value !== 'string' && typeof value !== 'number') return [];
+          const extra = (c.show ?? []).flatMap((field) => {
+            const v = row[field];
+            if (v === null || v === undefined) return [];
+            return [field.endsWith('_bytes') && typeof v === 'number' ? bytes(v) : String(v)];
+          });
+          const key = String(value);
+          return [{ value: key, label: extra.length ? `${key} — ${extra.join(' — ')}` : key }];
+        });
         setOffered((cur) => ({ ...cur, [k]: keys }));
       });
     }
@@ -238,8 +251,9 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
               <select value={raw[k]} onChange={(e) => setRaw({ ...raw, [k]: e.target.value })} name={k}
                 className="rounded-lg border border-line bg-bg px-2 py-1.5 text-fg">
                 <option value="">—</option>
-                {(raw[k] && !offered[k].includes(raw[k]!) ? [raw[k]!, ...offered[k]] : offered[k]).map((v) => (
-                  <option key={v} value={v}>{v}</option>
+                {(raw[k] && !offered[k].some((v) => v.value === raw[k])
+                  ? [{ value: raw[k]!, label: raw[k]! }, ...offered[k]] : offered[k]).map((v) => (
+                  <option key={v.value} value={v.value}>{v.label}</option>
                 ))}
               </select>
             ) : f.type === 'text' ? (

@@ -66,6 +66,15 @@ another from there with what that host's status says, and joins it on the
 other's (`cluster.descriptor.json`). `recover` is typed at the host's own
 shell alone: it is unsafe by design.
 
+For three or more fresh hosts, **Hosts → Set up cluster and NBS** drives the
+same calls as one reviewed setup: the first host is initialized, each other
+is invited and joined, then NBS is initialized and its hosts and devices are
+added. Before anything changes it shows every host's state and devices.
+Existing members are not initialized again, and their keys are checked
+against the first host's registry so two clusters are never merged by
+accident. A failure leaves the step that needs repeating said; **Review and
+retry** reads the state afresh and continues from it.
+
 At boot, /etc/rc loads both and starts ipcnet; the member starts by itself
 over its log:
 

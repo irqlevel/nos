@@ -155,6 +155,14 @@ The same is on the management bus as the `nbs` provider (`provider.rs`,
   one where none is given) -- a change to the metadata alone, its device
   taking no new chunks until it is added again.
 
+The panel's **Add a device** offers the host's own devices from `vm.devices`:
+their stable id, name, size and what is on them. Devices the machine boots
+from, or a mount, guest or other holder has, are not offered. A device with a
+filesystem or other data on it needs `wipe` and the explicit confirmation;
+the installer-created blank `nos-data` is normally the first choice. The
+cluster setup wizard offers the same list on every selected host before it
+adds anything.
+
 Reads are this member's view, at the entry it has applied. Every change is a
 command through the leader, answered once this member has applied it too:
 what is read next on the same host holds it.

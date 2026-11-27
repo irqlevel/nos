@@ -321,7 +321,7 @@ fn check_field(f: &Value, at: &'static str) -> Result<(), DescriptorError> {
 fn check_choices(field: &Value, choices: &Value, own: &Own) -> Result<(), DescriptorError> {
     const AT: &str = "methods.params.choices";
     let Some(members) = choices.as_object() else { return refuse(AT, "is an object") };
-    only(members, &["provider", "method", "items", "key"], AT)?;
+    only(members, &["provider", "method", "items", "key", "require", "show"], AT)?;
     if !matches!(field.get("type").and_then(Value::as_str), Some("string" | "int")) {
         return refuse(AT, "is for a string or an int: what an item's key is");
     }
@@ -331,6 +331,24 @@ fn check_choices(field: &Value, choices: &Value, own: &Own) -> Result<(), Descri
     name_str(choices.get("method"), AT)?;
     name_str(choices.get("items"), AT)?;
     name_str(choices.get("key"), AT)?;
+    if let Some(required) = choices.get("require") {
+        let Some(fields) = required.as_object() else { return refuse(AT, "require is an object of field values") };
+        for (name, value) in fields {
+            name_ok(name, AT)?;
+            if matches!(value, Value::List(_) | Value::Object(_)) {
+                return refuse(AT, "require compares a field to one value");
+            }
+        }
+    }
+    if let Some(shown) = choices.get("show") {
+        let Some(fields) = shown.as_list() else { return refuse(AT, "show is a list of fields") };
+        if fields.is_empty() {
+            return refuse(AT, "show names at least one field");
+        }
+        for name in fields {
+            name_str(Some(name), AT)?;
+        }
+    }
     if provider == own.provider && kind_of(own.methods, choices.get("method")) != Some("read") {
         return refuse(AT, "of the provider's own is a read it has");
     }

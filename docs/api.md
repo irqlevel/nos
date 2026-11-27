@@ -12,6 +12,7 @@ api client add panel admin 3fe5cf7a...570d
 api start
 api                     what it serves, who is connected, what it refused
 api stop
+api enroll ...          this host added to a panel by one command (below)
 api panel create        the management panel, a VM of the host's (below)
 ```
 
@@ -230,13 +231,30 @@ fingerprint.
 
 **More hosts.** The panel manages every host added on its Hosts page by its
 API's address and key -- a cluster's hosts, each its own dashboard, pages
-and history -- as one client of all of them, by the key its seed gave it. On
-another host: `api client add panel-<the key's first 8 digits> admin <the
-key>`, which the Hosts page prints (`panel` is that host's own panel's name
-where it has one); `listen = ["hv0", "eth0"]` and `allow_eth0` the panel's
-host's address in its api.toml -- the panel's VM reaches it through hv's NAT,
-from that address -- and `api stop`, `api start`; then, on the Hosts page,
-its address and port and the key its `api status` prints. A host that shows
+and history -- as one client of all of them, by the key its seed gave it.
+
+The short way is **Hosts → Connect a host with one command**. The panel makes
+a random one-time token, good for 15 minutes, and a command of this form:
+
+```
+api enroll 203.0.113.5:39233 <panel's 64 hex digits> <token's 64 hex digits> node-b nic=eth0
+```
+
+Run it on the new host. `api enroll` lets the panel's key in as an admin,
+puts its address alone in `allow_eth0`, adds eth0 to `listen` when needed,
+restarts the API, and calls the panel back over TLS pinned by the same key.
+The callback carries the host's API address and key; the panel adds it and
+spends the token. A token already used or past its time is refused, and a
+panel showing another key is not connected to. Repeating the command adds no
+second client or allowlist line; after a failed callback, make a fresh token
+in the panel. The address named is the panel host's external one: its VM
+reaches the new host through hv's NAT, from that address.
+
+The manual way remains: `api client add panel-<the key's first 8 digits>
+admin <the key>`, which the Hosts page prints (`panel` is that host's own
+panel's name where it has one); `listen = ["hv0", "eth0"]` and `allow_eth0`
+the panel host's address in api.toml, `api stop`, `api start`; then the
+address, port and key from `api status` in the panel's form. A host that shows
 another key is never reached, and the Hosts page says which key it showed.
 
 What it does not do yet:

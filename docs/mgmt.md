@@ -88,9 +88,12 @@ line in the log saying where and why, if it does not hold:
   come from, `choices`: a `provider` on the same host, its read `method`,
   and the `items` of its answer whose `key` each is a value -- `vm.create`'s
   `firewall`, `{"provider": "fw", "method": "list", "items": "firewalls",
-  "key": "name"}`. A client offers them as a list; another provider may not
-  be there, and the field is typed then; the descriptor's own provider is,
-  and its `method` is a read it registers. A resource's field shows a
+  "key": "name"}`. `require` may keep only items whose fields have the exact
+  values named, as NBS's device choices have `in_use_by` and
+  `boots_the_machine` null; `show` names fields added to the option's label.
+  A client offers them as a list; another provider may not be there, and the
+  field is typed then; the descriptor's own provider is, and its `method` is
+  a read it registers. A resource's field shows a
   value and offers none: `choices` there is refused;
 - **every text a person reads** -- each `title`, `help`, `confirm` and
   enum value -- an object of exactly `en` and `ru`, neither empty;

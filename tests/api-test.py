@@ -34,7 +34,11 @@ through nosctl's own client:
   - rmmod api with a stream, a request's connection and a handshake under
     way unloads at once, and leaves no slot of the port;
   - what a handshake costs, and how deep the connection's task went in it,
-    are printed.
+    are printed;
+  - api enroll adds the panel as a client and in api.toml's allowlist, then
+    reports the host to the test's panel over TLS pinned by its key: the
+    callback's one-time token, name, API address and host key read, a repeat
+    changing nothing, a panel showing another key refused.
 
 On x86-64, where the guests are, hv.ko is loaded too, and its vm provider
 taken through the API (vm_checks): a VM of hvboot -- which, given no disk,
@@ -503,6 +507,7 @@ def arm64(args, tmp, k):
             time.sleep(0.5)
 
         common(k, pin, "aarch64", sh)
+        enrollment_checks(sh, k, pin)
 
         out = sh.run("cat /etc/api/audit.log")
         pt.check("the audit log has the admin's action, the job started and the cancel",
@@ -557,6 +562,65 @@ def arm64(args, tmp, k):
         pt.check("nothing panicked", "PANIC" not in open(log, errors="replace").read())
     finally:
         stop(p)
+
+
+def enrollment_checks(sh, k, pin):
+    """The one-command enrollment, with the panel as a pinned TLS peer."""
+    import http.server
+    import threading
+    import urllib.parse
+
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(urllib.parse.urlsplit(self.path))
+            body = b'{"ok":true}\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    panel = k["stranger"]
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(panel[0], panel[1])
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    token = "ab" * 32
+    command = "api enroll 10.0.2.2:%d %s %s node-b" % (server.server_address[1], panel[2], token)
+    try:
+        sh.sock.settimeout(120)
+        out = sh.run(command)
+        pt.check("api enroll adds the host to the panel by its pinned callback", "node-b enrolled" in out, out)
+        pt.check("the callback carries the one-time token, the name, the API address and the host's key",
+                 len(requests) == 1 and requests[0].path == "/api/enroll" and
+                 dict(urllib.parse.parse_qsl(requests[0].query)) == {
+                     "token": token, "name": "node-b", "url": "10.0.2.15:%d" % PORT, "pin": pin,
+                 }, [r.geturl() for r in requests] + [out])
+        toml = sh.run("cat /etc/api/api.toml")
+        pt.check("enrollment keeps api.toml's lines and allows the panel's address alone on eth0",
+                 toml.startswith("# api-test.py") and 'allow_eth0 = ["10.0.2.2"]' in toml and
+                 'listen = ["eth0"]' in toml, toml)
+        clients = sh.run("api clients")
+        pt.check("the panel's key is an admin client once",
+                 clients.count("admin panel-%s" % panel[2][:8]) == 1, clients)
+        out = sh.run(command)
+        pt.check("the same enrollment is idempotent", "node-b enrolled" in out and
+                 sh.run("cat /etc/api/api.toml") == toml and
+                 sh.run("api clients").count("admin panel-%s" % panel[2][:8]) == 1, out)
+        pt.check("and it may report the host again without adding anything", len(requests) == 2, len(requests))
+        out = sh.run("api enroll 10.0.2.2:%d %s %s node-c" % (server.server_address[1], k["admin"][2], token))
+        pt.check("a panel showing a key other than the pinned one is refused", "TLS handshake was refused" in out and
+                 len(requests) == 2, out)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def image_server(tmp):

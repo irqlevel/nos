@@ -268,7 +268,7 @@ swallowing panic messages whole.
 | `hv-nbs-test.py --bzimage <bzImage> --initrd <cpio> [--keep] [--mem]` | x86-64, **manual** | hv's guests on volumes of NBS's (`disk=nbs:<volume>`): a pour read by a guest elsewhere; a disk hvboot boots made an image by `hv image`, and two VMs made of it on two hosts -- by `hv create ... image=nbs:`, and by the vm provider's create through the bus as the panel makes one -- each booted by its name -- by hvboot, through the 4 KiB blocks of a volume -- off a clone of its own, one written over a chunk the image shares and the other still the image's, and the refusals; an image made by the vm provider's `image`; the written one's disk activity through the vm provider's `disk_io` -- its volume's reads and writes counted, and the time they waited, growing between two asks -- and its disk snapshotted by the vm provider's `snapshot` as it runs, and a VM of the snapshot booted on the other host, its disk the written one's then; a guest's writes read back and moved with the volume, a forced start fencing the old guest, a host killed under a write -- three nos under KVM where the host has it, the guests nested; `--mem` says the hosts' `memusage` at each step |
 | `vm-migration-test.py --bzimage <bzImage> --initrd <cpio> [--keep]` | x86-64, **manual** | a running VM moved between hosts (`hv migrate`, plans/vm-migration.md): three nos with ipcnet, the registry, NBS and vnet; the refusals -- no such VM, this host, a disk that is a file it writes, a name the other host has a folder of -- each leaving it running; a guest on a volume of NBS's, counting in its memory and writing files of random bytes and their sums all the while, moved a to b live, b to a cold, a to b live again: each time on the other host's list and not the first's, its folder moved, its counter and uptime gone on, its kernel saying nothing of a clock or a CPU gone wrong, every file its writer made whole there with its own sum, the volume's writer the new host's, what it wrote on each host read back on the others; on vnet's network, a probe on the third host pinging it through each move, answered again once it runs there, it reaching the probe from there, its port and its firewall's flows on the new host; then stopped and booted cold from the moved folder |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
-| `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages: a host's cluster and NBS made from it, VMs of an image of NBS's, an image of a URL and a local file chosen from `/images`, a VM's snapshot and a VM of it, a VM's disks' IOPS and bandwidth charted, NBS's volumes and a VM's disks coloured by their health, I/O errors and latency, NBS's alerts the worst first, a job's polling ended with it |
+| `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages: enrollment by one command and a token used once, three hosts joined and NBS made by the setup wizard, devices chosen from the host's list and wiped only when confirmed, VMs of an image of NBS's, an image of a URL and a local file chosen from `/images`, a VM's snapshot and a VM of it, a VM's disks' IOPS and bandwidth charted, NBS's volumes and a VM's disks coloured by their health, I/O errors and latency, NBS's alerts the worst first, a job's polling ended with it |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
 
 ### By what you touched, at length
@@ -781,6 +781,12 @@ it checks:
   once and leaves no slot of the port;
 - and it prints what a handshake costs and how deep a connection's task went.
 
+On arm64, `api enroll` is driven against the test's own TLS server with a
+self-signed certificate: the panel's key pinned, the callback's token, name,
+API address and host key checked, the panel's client and allowlist read back,
+a repeat made to change nothing, and a panel showing the wrong key refused
+before it can answer.
+
 `--arch x86_64` is its short form: nos.iso, a root whose /etc/rc loads the
 modules and starts the API, and what needs no shell -- every check above
 but the shell's own commands, sshd, the client list's changes and the unload.
@@ -816,6 +822,17 @@ fetched by its URL and held to its SHA-256; and api.toml has the address in
 `api panel create` must make nothing and start the panel's VM -- a `vm.start`
 job that ends ok -- as it does at every boot after the first. Needs openssl
 and QEMU; a few minutes on arm64 under HVF.
+
+### `panel`: Playwright against the host API's mock
+
+`cd panel && npx playwright test` drives the built panel, both languages and
+both themes. Besides the providers' pages, it connects a host by an
+enrollment token, checks its callback adds it and a second use is refused;
+then takes three fresh hosts through **Set up cluster and NBS**: registry and
+NBS initialized, every other host invited and joined, and a device added on
+each. The NBS device form and the wizard offer only devices nothing holds and
+the machine does not boot from, with their names, sizes and contents; the one
+with a filesystem goes in only with `wipe` and the separate confirmation.
 
 ### `panel-appliance-test.py` -- the panel's bundle, run as its VM runs it
 
