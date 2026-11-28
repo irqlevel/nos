@@ -1221,6 +1221,23 @@ logins through the first port passed. The firmware refused the TX QP's FPP bit
 at INIT2RTR despite advertising PORT_REMAP; the driver retries that transition
 without it. Reboot and link recovery remain to be exercised.
 
+On the same day's three-server VLAN 3515 stand, private IPv4 on the second
+port (`eth3`) and three-way `ipcnet` passed. The 10 ms timer originally capped
+RX at 6,400 pps; a budget-exhausted pass now requests the next receive softirq
+at once, and a periodic TX pass reaps completions even with no new frame.
+Ten-second sink runs sent 8.2 Gbit/s and delivered 2.1 Gbit/s. A short
+single-sender run reached 9.9 Gbit/s with one doorbell per batch. IPC/TLS bulk
+echo reached 7--10 MB/s in the two directions, with every answer checked.
+Linux-to-Linux load on the same VLAN passed 20 seconds with zero TX errors.
+
+Those are not a claim of sustained 10G. Long full-speed and paced runs still
+produce a TX error CQE (`0x02`, vendor `0x6d`) and the QP enters the firmware
+error state. `mlxdump [n]` reads the live QP contexts after such a failure;
+the first error is logged with its WQE, and consumer handling advances to the
+CQE's index rather than assuming one WQE per CQE. The cause of that error is
+still open, so NBS must not be offered on this driver as production storage
+networking yet.
+
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 
 Loads the [`netload` module](modules.md#netload) and hammers its UDP target
