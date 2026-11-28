@@ -9,7 +9,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `cls` | Clear screen |
 | `cpu` | Dump CPU state |
 | `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT), the performance counters it has (Intel architectural perfmon, or AMD core counters and PerfMonV2), and which of them `profile` will actually sample with |
-| `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
+| `dmesg [lines] [filter]` / `dmesg save <path> [lines] [filter]` | Dump the kernel log: newest `lines` messages (all of it if omitted), optional substring filter; `save` writes the same output atomically to `path` (`<path>.new` first), creating `/logs` when it is the destination's parent |
 | `loglevel [N]` | Show or set the log level (0-5) on a running kernel |
 | `mark <text>` | A line of your own into the kernel log, `mark: <text>` -- onto the consoles, the netconsole and the disk log with every other line: a mark to find later, set before something is tried on a box whose only console is the network |
 | `uptime` | Show uptime |

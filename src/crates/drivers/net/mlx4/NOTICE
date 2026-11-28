@@ -1,0 +1,17 @@
+stormnic-mlx4
+=============
+
+An original Rust implementation, licensed MIT (see LICENSE).
+
+Acknowledgement: the hardware facts in docs/spec/connectx3.md (register,
+command and mailbox layouts, field offsets and bit widths, opcodes, constants
+and command sequences for the Mellanox/NVIDIA ConnectX-3 and ConnectX-3 Pro)
+were learned from these drivers (dual GPL-2 / OpenIB.org BSD):
+
+  - Linux: drivers/net/ethernet/mellanox/mlx4/ and include/linux/mlx4/
+    (torvalds/linux, commits 6f8319e3e9a4 and 69f80fef3153)
+  - FreeBSD: sys/dev/mlx4/ (freebsd/freebsd-src, commits 669cd0d90ee7 and
+    274236ed084a)
+
+No source code was copied; the driver is a rewrite, and docs/spec/ describes
+the hardware in its own words.

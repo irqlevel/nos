@@ -39,7 +39,7 @@ src/crates/   The Rust half, one cargo workspace, a directory an area: what the 
     ipc/      The message channel, in the image: mailboxes with addresses that are looked up, names in the host's namespace under a module's own, messages, monitors and watches, the router to other hosts' channels and its peers, and the `ipc` command (docs/ipc.md)
   drivers/
     block/    ahci/ (SATA disks behind an AHCI HBA, by DMA: NCQ, the HBA's MSI, a task for its failures), ata/ (ATA disks behind a PCI IDE controller -- SATA in IDE mode, parallel ATA -- by PIO, polled), nvme/ (NVMe: PCI, MSI-X, admin and I/O queues), virtio_blk/ (virtio-blk, the disk the root filesystem lives on), virtio_scsi/ (virtio-scsi, a SCSI adapter and the disks behind it)
-    net/      e1000e/ (Intel 82574L, gigabit), igb/ (Intel 82576, I210 and I350, gigabit), r8125/ (Realtek RTL8125, 2.5GbE), r8168/ (Realtek r8168), virtio_net/ (virtio-net, the card the network comes in on)
+    net/      e1000e/ (Intel 82574L, gigabit), igb/ (Intel 82576, I210 and I350, gigabit), mlx4/ (Mellanox ConnectX-3/3 Pro Ethernet, firmware HCA and EQ/CQ/QP), r8125/ (Realtek RTL8125, 2.5GbE), r8168/ (Realtek r8168), virtio_net/ (virtio-net, the card the network comes in on)
     rng/      virtio_rng/ (virtio-rng, the host's entropy)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + the HID boot-protocol keyboard on it
     virtio/   The virtio foundation the virtio drivers share: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2

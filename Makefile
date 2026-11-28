@@ -655,8 +655,10 @@ IMAGE_STAGE = $(OUT)/image
 # The licenses whose notice the kernel, its modules and the guest firmware
 # carry, each in the image's /lib/licenses: CRYPTOGAMS', whose assembly the
 # crypto crate runs (src/crates/base/crypto/cryptogams/README.md), and
-# CloudHv's EDK2, Xen and LZMA notices (build/image/CLOUDHV.license).
-LICENSES = src/crates/base/crypto/cryptogams/LICENSE build/image/CLOUDHV.license
+# CloudHv's EDK2, Xen and LZMA notices (build/image/CLOUDHV.license), and
+# stormnic-mlx4's MIT notice (drivers/net/mlx4).
+LICENSES = src/crates/base/crypto/cryptogams/LICENSE build/image/CLOUDHV.license \
+    src/crates/drivers/net/mlx4/LICENSE src/crates/drivers/net/mlx4/NOTICE
 PANEL_BUNDLE ?=
 PANEL_BUNDLE_URL ?=
 
@@ -673,6 +675,8 @@ $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc sc
 	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/lib/licenses $(IMAGE_STAGE)/etc
 	install -m 0644 src/crates/base/crypto/cryptogams/LICENSE $(IMAGE_STAGE)/lib/licenses/CRYPTOGAMS
 	install -m 0644 build/image/CLOUDHV.license $(IMAGE_STAGE)/lib/licenses/CLOUDHV
+	install -m 0644 src/crates/drivers/net/mlx4/LICENSE $(IMAGE_STAGE)/lib/licenses/MLX4
+	install -m 0644 src/crates/drivers/net/mlx4/NOTICE $(IMAGE_STAGE)/lib/licenses/MLX4-NOTICE
 	$(OBJCOPY) --strip-debug $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
 	chmod 0644 $(IMAGE_STAGE)/boot/kernel64.elf
 	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/

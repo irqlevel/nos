@@ -146,12 +146,17 @@ bool FixedPageAllocator::free(void* addr)
 void FixedPageAllocator::unmap_and_free(ulong va)
 {
     auto& pt = PageTable::get_instance();
-    BUG_ON(page_count_ > MAX_PAGE_COUNT);
+    BUG_ON(page_count_ > PageTable::MAX_DMA_CONTIGUOUS_PAGES);
     Page* frames[MAX_PAGE_COUNT];
 
-    pt.unmap_pages(va, page_count_, frames);
-    kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
-    pt.free_pages(frames, page_count_);
+    for (ulong done = 0; done < page_count_;)
+    {
+        const ulong count = stdlib::min<ulong>(MAX_PAGE_COUNT, page_count_ - done);
+        pt.unmap_pages(va + done * consts::PAGE_SIZE, count, frames);
+        kernel::CpuTable::get_instance().invalidate_tlb_range(va + done * consts::PAGE_SIZE, count);
+        pt.free_pages(frames, count);
+        done += count;
+    }
 }
 
 bool FixedPageAllocator::contains(void* addr)
@@ -200,9 +205,30 @@ bool PageAllocatorImpl::setup()
         }
     }
 
+    /* Large DMA gets classes of its own, so the general heap and its caches
+       keep their old bounds. */
+    for (size_t i = 0; i < LARGE_DMA_LOGS; i++)
+    {
+        const size_t log = i + PAGE_LOG_LIMIT;
+        const ulong start = end_address + i * size_per_balloc;
+        const ulong block_size = (1UL << log) * consts::PAGE_SIZE;
+        const ulong end = start + size_per_balloc;
+        const ulong aligned = stdlib::round_up(start, block_size);
+        if (aligned >= end || block_size > end - aligned)
+        {
+            klog(0, "page allocator: no VA for a large-DMA class of %lu pages", block_size / consts::PAGE_SIZE);
+            continue;
+        }
+        if (!large_dma_pg_alloc_[i].setup(aligned, end, block_size / consts::PAGE_SIZE))
+        {
+            return false;
+        }
+    }
+    const ulong large_dma_end = end_address + LARGE_DMA_LOGS * size_per_balloc;
+
     /* The large runs get a window of their own, past the blocks' */
     const ulong large_block = PageTable::MAX_LARGE_MAP_PAGES * consts::PAGE_SIZE;
-    const ulong large_start = stdlib::round_up(end_address, large_block);
+    const ulong large_start = stdlib::round_up(large_dma_end, large_block);
     const ulong large_end = large_start + LARGE_BLOCK_COUNT * large_block;
 
     /* All of it inside the image's top-level entry: the windows mapped by
@@ -336,11 +362,19 @@ void PageAllocatorImpl::release_quarantined(size_t log, void* addr)
         fixed_pg_alloc_[log].free_va(reinterpret_cast<void*>(oldest));
 }
 
+FixedPageAllocator& PageAllocatorImpl::dma_pg_alloc(size_t log)
+{
+    BUG_ON(log >= DMA_PAGE_LOG_LIMIT);
+    if (log < PAGE_LOG_LIMIT)
+        return fixed_pg_alloc_[log];
+    return large_dma_pg_alloc_[log - PAGE_LOG_LIMIT];
+}
+
 bool PageAllocatorImpl::class_of(void* addr, size_t& log)
 {
-    for (size_t i = 0; i < stdlib::array_size(fixed_pg_alloc_); i++)
+    for (size_t i = 0; i < DMA_PAGE_LOG_LIMIT; i++)
     {
-        if (fixed_pg_alloc_[i].contains(addr))
+        if (dma_pg_alloc(i).contains(addr))
         {
             log = i;
             return true;
@@ -352,7 +386,7 @@ bool PageAllocatorImpl::class_of(void* addr, size_t& log)
 void PageAllocatorImpl::release(void* addr)
 {
     size_t log;
-    if (!class_of(addr, log) || !fixed_pg_alloc_[log].free(addr))
+    if (!class_of(addr, log) || !dma_pg_alloc(log).free(addr))
         PANIC("Can't free addr 0x%p", addr);
 }
 
@@ -603,7 +637,7 @@ void* PageAllocatorImpl::alloc_map_pages(size_t num_pages, ulong* phys_addr)
     BUG_ON(num_pages == 0);
 
     size_t log = stdlib::log2(num_pages);
-    if (log >= stdlib::array_size(fixed_pg_alloc_))
+    if (log >= DMA_PAGE_LOG_LIMIT)
         return nullptr;
 
     /* Kept blocks hold pages and this size's VA both: once more without
@@ -622,7 +656,7 @@ void* PageAllocatorImpl::try_alloc_map_pages(size_t log, ulong* phys_addr)
     if (!pages)
         return nullptr;
 
-    void* result = fixed_pg_alloc_[log].map(pages);
+    void* result = dma_pg_alloc(log).map(pages);
     if (!result)
     {
         for (size_t i = 0; i < rounded_pages; i++)

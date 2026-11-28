@@ -1,0 +1,10 @@
+[package]
+name = "mlx4"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+kcore = { path = "../../../base/kcore" }
+net = { path = "../../../layers/net" }

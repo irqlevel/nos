@@ -182,6 +182,8 @@ cp img/VERSION img-version.out
 cat img/lib/panel/bundle > img-bundle.out 2>/dev/null || echo none > img-bundle.out
 cat img/lib/licenses/CRYPTOGAMS > img-license.out 2>/dev/null || echo none > img-license.out
 cat img/lib/licenses/CLOUDHV > img-cloudhv-license.out 2>/dev/null || echo none > img-cloudhv-license.out
+cat img/lib/licenses/MLX4 > img-mlx4-license.out 2>/dev/null || echo none > img-mlx4-license.out
+cat img/lib/licenses/MLX4-NOTICE > img-mlx4-notice.out 2>/dev/null || echo none > img-mlx4-notice.out
 """
 
 PREPARE = r"""
@@ -1222,6 +1224,9 @@ def run(tmp, image):
     check("the image carries the notice of the CRYPTOGAMS assembly its kernel and modules run, as its "
           "license asks of a binary", "CRYPTOGAMS by <appro@openssl.org>" in notice and
           "Redistributions in binary form" in notice, notice[:200])
+    check("the image carries stormnic-mlx4's MIT license and hardware-source acknowledgement",
+          "Copyright (c) 2026 glennswest" in linux.read("img-mlx4-license.out") and
+          "OpenIB.org BSD" in linux.read("img-mlx4-notice.out"))
     env2 = linux.read("grubenv2.out")
     check("update takes the UDP shell it was given, and arms a boot",
           "nos_cmdline=udpshell=9000" in env2 and "nos_next=nos" in env2, env2)

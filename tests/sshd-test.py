@@ -797,6 +797,12 @@ def x86_64(t):
         check("a shell with a terminal", rc == 0 and "listening" in out, repr(out[-300:]))
         rc, out, _ = t.ssh(["dmesg", "60", "rc:"])
         check("rc's output in the kernel log", rc == 0 and "rc: /etc/rc done" in out, out)
+        rc, out, _ = t.ssh(["dmesg", "save", "/logs/dmesg-save-test.txt", "boot: complete"])
+        check("dmesg save writes a filtered log to a file", rc == 0 and "saved" in out, out)
+        rc, out, _ = t.ssh(["cat", "/logs/dmesg-save-test.txt"])
+        check("dmesg save's file has the line and no other", rc == 0 and "boot: complete" in out and "rc:" not in out, out)
+        rc, out, _ = t.ssh(["rm", "/logs/dmesg-save-test.txt"])
+        check("dmesg save's test file removed", rc == 0, out)
         data = os.urandom(300000)
         sent, back = os.path.join(t.tmp, "sent.bin"), os.path.join(t.tmp, "back.bin")
         with open(sent, "wb") as f:

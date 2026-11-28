@@ -327,6 +327,9 @@ public:
     void set_zero_check(bool on);
     bool is_zero_check();
     static const ulong MAX_CONTIGUOUS_PAGES = 128;
+    /* The most pages alloc_map_pages allocates contiguously for DMA: 16 MiB.
+       The general heap stays limited to MAX_CONTIGUOUS_PAGES. */
+    static const ulong MAX_DMA_CONTIGUOUS_PAGES = 4096;
 
     /* The most pages mm::map_large_pages maps at one run of VA: 16 MiB, for
        what outgrows the largest block map_pages serves -- a loadable
@@ -335,7 +338,7 @@ public:
     /* A run of count pages, physically contiguous, zeroed -- found and
        taken off the free lists under Lock, then zeroed off it a page at a
        time, as alloc_page zeroes one, the pages known zero left as they
-       are -- or nullptr for none. count is 1 to MAX_CONTIGUOUS_PAGES. */
+       are -- or nullptr for none. count is 1 to MAX_DMA_CONTIGUOUS_PAGES. */
     Page* alloc_contiguous_pages(ulong count);
     void free_page(Page* page);
 

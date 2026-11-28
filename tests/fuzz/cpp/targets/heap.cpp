@@ -184,7 +184,7 @@ Page* PageTable::alloc_page()
 
 Page* PageTable::alloc_contiguous_pages(ulong count)
 {
-    if (!take(page_model.fail_after) || count == 0 || count > MAX_CONTIGUOUS_PAGES)
+    if (!take(page_model.fail_after) || count == 0 || count > MAX_DMA_CONTIGUOUS_PAGES)
         return nullptr;
     for (ulong i = 0; i + count <= page_model.all.size(); i++)
     {
