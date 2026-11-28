@@ -1239,7 +1239,7 @@ Page* PageTable::take_run_no_lock(ulong count, bool* zeroed, ulong& examined)
    pages that had held a guest's code. */
 Page* PageTable::alloc_contiguous_pages(ulong count)
 {
-    if (count == 0 || count > MAX_CONTIGUOUS_PAGES)
+    if (count == 0 || count > MAX_DMA_CONTIGUOUS_PAGES)
         return nullptr;
 
     /* The walk is unbounded by design: capping it would turn a slow
@@ -1250,7 +1250,7 @@ Page* PageTable::alloc_contiguous_pages(ulong count)
     static const ulong LONG_SEARCH_ENTRIES = 1024;
     ulong examined = 0;
     /* Which pages of the run were known zero, as they came off their lists */
-    bool zeroed[MAX_CONTIGUOUS_PAGES] = {};
+    bool zeroed[MAX_DMA_CONTIGUOUS_PAGES] = {};
     Page* run = nullptr;
     {
         stdlib::AutoLock lock(lock_);

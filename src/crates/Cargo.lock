@@ -587,6 +587,7 @@ dependencies = [
  "kcore",
  "mgmt",
  "mgmtwire",
+ "mlx4",
  "net",
  "nvme",
  "r8125",
@@ -658,6 +659,14 @@ name = "migwire"
 version = "0.1.0"
 dependencies = [
  "codec",
+]
+
+[[package]]
+name = "mlx4"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "net",
 ]
 
 [[package]]

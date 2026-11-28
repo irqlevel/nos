@@ -110,6 +110,8 @@ private:
     ~PageAllocatorImpl();
 
     static const size_t PAGE_LOG_LIMIT = stdlib::const_log2(PageTable::MAX_CONTIGUOUS_PAGES) + 1;
+    static const size_t DMA_PAGE_LOG_LIMIT = stdlib::const_log2(PageTable::MAX_DMA_CONTIGUOUS_PAGES) + 1;
+    static const size_t LARGE_DMA_LOGS = DMA_PAGE_LOG_LIMIT - PAGE_LOG_LIMIT;
 
     /* Free and Alloc keep a block of the heap's freed with its pages still
        mapped, and hand it out again: a block that comes back costs neither
@@ -207,6 +209,9 @@ private:
     void release(void* addr);
     /* One try at alloc_map_pages, of 1 << log pages */
     void* try_alloc_map_pages(size_t log, ulong* phys_addr);
+    /* The allocator of a DMA size: the general heap's for the small ones,
+       the large-DMA pools above them. */
+    FixedPageAllocator& dma_pg_alloc(size_t log);
 
     PageAllocatorImpl(const PageAllocatorImpl& other) = delete;
     PageAllocatorImpl(PageAllocatorImpl&& other) = delete;
@@ -214,6 +219,7 @@ private:
     PageAllocatorImpl& operator=(PageAllocatorImpl&& other) = delete;
 
     FixedPageAllocator fixed_pg_alloc_[PAGE_LOG_LIMIT];
+    FixedPageAllocator large_dma_pg_alloc_[LARGE_DMA_LOGS];
 
     /* How many large runs can be mapped at once -- one less, the first
        block holding the window's own bitmap. 1 GiB of VA, which costs page

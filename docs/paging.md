@@ -233,7 +233,7 @@ shoots down the other CPUs once for the whole range.
 
 Three layers, each built on the one below.
 
-**`PageTable::alloc_page` / `alloc_contiguous_pages(n ≤ 128)`** — frames off
+**`PageTable::alloc_page` / `alloc_contiguous_pages(n ≤ 4096)`** — frames off
 the free list. A contiguous run is found by walking the free list and, for
 each candidate, checking that the next n-1 descriptors in `page_array_` are
 physically consecutive and still free — a self-pointing list entry is what
@@ -245,11 +245,15 @@ after the lock is let go, a page at a time, as `alloc_page` zeroes a page:
 under the lock, a run of 128 pages was half a megabyte of stores with
 interrupts off and every other CPU's allocation waiting for it.
 
-**`PageAllocatorImpl`** — eight `FixedPageAllocator` buckets, for 1, 2, 4 …
-128 pages. The VA arena starts where `page_array_` ends and spans 70% of the
-free page count; each bucket gets an eighth of it and tracks it with a
-`VaAllocator` bitmap (`mm/va_allocator.h`), whose blocks are aligned to their
-own size. The
+**`PageAllocatorImpl`** — eight general-heap `FixedPageAllocator` buckets,
+for 1, 2, 4 … 128 pages, and five large-DMA buckets for 256, 512, 1024,
+2048 and 4096 pages (1, 2, 4, 8 and 16 MiB). The general VA arena starts where
+`page_array_` ends and spans 70% of the free page count; each general bucket
+gets an eighth of it and tracks it with a `VaAllocator` bitmap
+(`mm/va_allocator.h`), whose blocks are aligned to their own size. The
+large-DMA buckets have equally sized windows beyond it, so the general heap
+and its per-CPU caches keep their old bounds. Large blocks are unmapped and
+freed in batches of 128 pages. The
 `mm::` surface on top of it (`mm/new.h`):
 
 | API | Allocates frames? | Tracked VA? | Frees frames on release? |

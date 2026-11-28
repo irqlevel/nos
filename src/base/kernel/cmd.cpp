@@ -139,10 +139,73 @@ static void cmd_cpu(const char* args, stdlib::Printer& con)
     hal::print_cpu_state(con);
 }
 
+static void dmesg_save(const char* args, stdlib::Printer& con)
+{
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    if (tok == nullptr || static_cast<ulong>(end - tok) >= MAX_PATH)
+    {
+        con.printf("usage: dmesg save <path> [lines] [filter]\n");
+        return;
+    }
+
+    char path[MAX_PATH];
+    stdlib::token_copy(tok, end, path, sizeof(path));
+
+    char filter[64] = {};
+    ulong last_lines = 0;
+    ulong count;
+    tok = stdlib::next_token(end, end);
+    if (tok != nullptr)
+        stdlib::token_copy(tok, end, filter, sizeof(filter));
+    if (filter[0] != '\0' && stdlib::parse_ulong(filter, count))
+    {
+        last_lines = count;
+        filter[0] = '\0';
+        tok = stdlib::next_token(end, end);
+        if (tok != nullptr)
+            stdlib::token_copy(tok, end, filter, sizeof(filter));
+    }
+
+    const ulong cap = 128 * consts::PAGE_SIZE;
+    char* buf = static_cast<char*>(mm::alloc(cap, 0));
+    if (buf == nullptr)
+    {
+        con.printf("dmesg: no memory to save the log\n");
+        return;
+    }
+
+    stdlib::BufferPrinter out(buf, cap);
+    Dmesg::get_instance().dump(out, last_lines, filter[0] != '\0' ? filter : nullptr);
+    const ulong len = stdlib::str_len(buf);
+    if (len + 1 >= cap)
+    {
+        mm::free(buf);
+        con.printf("dmesg: the log does not fit in the save buffer\n");
+        return;
+    }
+
+    if (stdlib::mem_cmp(path, "/logs/", 6) == 0)
+        (void)kernel_dir_create("/logs", 5);
+    const int result = kernel_file_write(path, stdlib::str_len(path), buf, len);
+    mm::free(buf);
+    if (result != 0)
+    {
+        con.printf("dmesg: cannot save to %s\n", path);
+        return;
+    }
+    con.printf("dmesg: saved %lu bytes to %s\n", len, path);
+}
+
 static void cmd_dmesg(const char* args, stdlib::Printer& con)
 {
     const char* end;
     const char* tok = stdlib::next_token(args, end);
+    if (tok != nullptr && end - tok == 4 && stdlib::strn_cmp(tok, "save", 4) == 0)
+    {
+        dmesg_save(end, con);
+        return;
+    }
 
     char filter[64];
     filter[0] = '\0';

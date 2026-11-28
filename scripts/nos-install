@@ -159,7 +159,7 @@ EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 6
 # holds the notices of the code the kernel, its modules and the firmware
 # carry, and goes with them
 SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/CLOUDHV.fd lib/panel lib/licenses VERSION"
-LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS lib/licenses/CLOUDHV boot/grub/nos.cfg etc/rc nos-install nos-setup boot boot/grub etc lib "
+LAYOUT=" $SYSTEM lib/panel/bundle lib/licenses/CRYPTOGAMS lib/licenses/CLOUDHV lib/licenses/MLX4 lib/licenses/MLX4-NOTICE boot/grub/nos.cfg etc/rc nos-install nos-setup boot boot/grub etc lib "
 # The management panel's lines of /etc/rc (--panel): hv and the host API,
 # then the panel's VM -- made at the first boot, started at every one after
 PANEL_RC=(

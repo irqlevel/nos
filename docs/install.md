@@ -43,6 +43,7 @@ but cannot fix any of them:
   there: no modules, no `/etc/rc`, no sshd.
 - **A network card nos drives**: Realtek RTL8168 or RTL8125, Intel 82576,
   I210, I211 or I350 (the `igb` driver), Intel 82574L (the `e1000e`
+  driver), Mellanox ConnectX-3 or ConnectX-3 Pro Ethernet (the `mlx4`
   driver), or virtio-net. With any other, nos boots and nobody can reach it. A network
   that hands out no address by DHCP is given one with
   `--ip A.B.C.D/N --gw A.B.C.D --dns A.B.C.D` -- what its Linux has
@@ -89,6 +90,7 @@ What is in it:
 | `/lib/CLOUDHV.fd` | OVMF's CloudHv UEFI guest firmware, from the pinned EDK2 source ([Build](build.md#cloudhv-guest-firmware)); the platform it needs is [`plans/windows.md`](../plans/windows.md) |
 | `/lib/licenses/CLOUDHV` | the firmware's EDK2, Xen and LZMA notices |
 | `/lib/licenses/CRYPTOGAMS` | the license of the CRYPTOGAMS assembly the kernel and its modules run -- ChaCha20-Poly1305's ([HTTPS](tls.md#the-assembly)) -- which asks a binary handed out to carry it |
+| `/lib/licenses/MLX4`, `MLX4-NOTICE` | the MIT license and hardware-source acknowledgement of stormnic-mlx4, whose ConnectX-3 protocols the `mlx4` driver adapts |
 | `/etc/rc` | the default boot script: `insmod /lib/modules/sshd.ko`, `sshd start` |
 | `/nos-install` | the installer, the one that knows this image |
 | `/nos-setup` | the installer's dialog, the ISO's, run in a provider's rescue system from the image mounted ([From a provider's rescue system](#from-a-providers-rescue-system)); like `nos-install`, it stays in the image |
@@ -270,7 +272,9 @@ the interfaces' settings from `/etc/net.toml` there -- addresses by DHCP, or the
 static one the install was given ([The network](#the-network)) -- and runs `/etc/rc`, whose `sshd start` makes the host key the
 first time -- from the kernel's entropy pool, into
 `/etc/ssh/ssh_host_ed25519_key`, kept there for every boot after -- and lets
-in the keys of `/etc/ssh/authorized_keys` ([sshd](sshd.md)). About a minute
+in the keys of `/etc/ssh/authorized_keys` ([sshd](sshd.md)). It listens on
+`eth0` by default; when the address is on another interface, change the line
+to, for example, `sshd start 22 nic=eth2`. About a minute
 after the reset:
 
 ```sh

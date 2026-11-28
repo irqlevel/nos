@@ -861,7 +861,8 @@ Needs Docker and openssl; a minute, more under emulation.
 
 End to end against OpenSSH's own client (see [sshd](sshd.md)). On arm64 it
 loads `sshd.ko` over the UDP shell and has `ssh` work it: commands, a shell
-with a terminal and one without, Up and ^R through a terminal's history, a
+with a terminal and one without, a filtered `dmesg save` read back and removed,
+Up and ^R through a terminal's history, a
 1,023-character command kept whole, 3 MiB of output through the client's window
 with rekeys in the middle, a command that prints nothing for five seconds
 while the client asks every second whether the server is there (`ssh -o
@@ -1205,6 +1206,20 @@ which makes the host's key, and everything else is the registry's
   alone after; the removed host's key refused when invited again;
 - nothing panicked.
 
+
+### `mlx4-test.py` -- ConnectX-3's formats and steering tables
+
+Compiles the driver's hardware-independent modules as they are and holds them
+to simulated firmware and known bytes: BAR numbering on EDK2 and AMI, MCG
+entry encoding and chained attach/detach with rollback on failure, and
+SFP/QSFP EEPROM and PTYS link-mode decoding. ConnectX-3 has no emulator: the
+RX/TX path, both ports, static IPv4, ARP, SSH, reboot and link recovery are
+the manual hardware checklist on the Supermicro X9 machines with `15b3:1003`.
+On 2026-11-28, firmware 2.42.5000 brought up both ports at 10G; static /31
+IPv4, ARP, ICMP to the gateway, a peer host and the internet, and root SSH
+logins through the first port passed. The firmware refused the TX QP's FPP bit
+at INIT2RTR despite advertising PORT_REMAP; the driver retries that transition
+without it. Reboot and link recovery remain to be exercised.
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 

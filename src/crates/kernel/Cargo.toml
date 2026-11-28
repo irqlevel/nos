@@ -35,6 +35,7 @@ r8168 = { path = "../drivers/net/r8168" }
 r8125 = { path = "../drivers/net/r8125" }
 e1000e = { path = "../drivers/net/e1000e" }
 igb = { path = "../drivers/net/igb" }
+mlx4 = { path = "../drivers/net/mlx4" }
 # For the sha256 shell command; the same crate the TLS client hashes with.
 # force-soft for the same reason .cargo/config.toml forces the other
 # RustCrypto crates onto their software backends: sha2 would otherwise pick

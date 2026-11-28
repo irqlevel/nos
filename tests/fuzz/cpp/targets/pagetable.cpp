@@ -846,7 +846,7 @@ void alloc_run(fuzz::Input& in)
         fuzz::reached("no contiguous run");
         return;
     }
-    INVARIANT(count <= PageTable::MAX_CONTIGUOUS_PAGES, "a run of %lu pages, past the most", count);
+    INVARIANT(count <= PageTable::MAX_DMA_CONTIGUOUS_PAGES, "a run of %lu pages, past the most", count);
     ulong base = first->get_phy_address();
     for (ulong i = 0; i < count; i++)
     {

@@ -1635,6 +1635,53 @@ stdlib::Error test_page_allocator()
         }
     }
 
+    /* A large DMA buffer: the firmware area of a ConnectX-3, rounded up to
+       the allocator's power-of-two block. */
+    {
+        const ulong pages = 2082;
+        const ulong mapped = 1UL << stdlib::log2(pages);
+        ulong warm_phys = 0;
+        void* warm = mm::alloc_map_pages(pages, &warm_phys);
+        if (warm != nullptr)
+            mm::unmap_free_pages(warm);
+
+        const ulong free_pages_before = pt.get_free_pages_count();
+        ulong phys_addr = 0;
+        u8* p = static_cast<u8*>(mm::alloc_map_pages(pages, &phys_addr));
+        if (p == nullptr || phys_addr == 0)
+        {
+            klog(0, "test_page_allocator: alloc_map_pages(%lu) failed", pages);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+        for (ulong pg = 0; pg < mapped; pg++)
+        {
+            p[pg * consts::PAGE_SIZE] = static_cast<u8>(pg);
+            p[pg * consts::PAGE_SIZE + consts::PAGE_SIZE - 1] = static_cast<u8>(pg);
+            const ulong va = reinterpret_cast<ulong>(p + pg * consts::PAGE_SIZE);
+            if (pt.virt_to_phys(va) != phys_addr + pg * consts::PAGE_SIZE)
+            {
+                klog(0, "test_page_allocator: large DMA page %lu not physically contiguous", pg);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
+            }
+        }
+        for (ulong pg = 0; pg < mapped; pg++)
+        {
+            if (p[pg * consts::PAGE_SIZE] != static_cast<u8>(pg) ||
+                p[pg * consts::PAGE_SIZE + consts::PAGE_SIZE - 1] != static_cast<u8>(pg))
+            {
+                klog(0, "test_page_allocator: large DMA page %lu mismatch", pg);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
+            }
+        }
+        mm::unmap_free_pages(p);
+        if (pt.get_free_pages_count() != free_pages_before)
+        {
+            klog(0, "test_page_allocator: large DMA free count mismatch: %lu expected %lu",
+                pt.get_free_pages_count(), free_pages_before);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
+        }
+    }
+
     klog(0, "test_page_allocator: complete");
     return make_success();
 }

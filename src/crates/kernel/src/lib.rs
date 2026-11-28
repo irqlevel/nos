@@ -65,7 +65,8 @@ pub extern "C" fn rust_init() {
     r8168::init();
     r8125::init();
     igb::init();
-    /* Its names, as igb's, are the lowest ethN the device table has free
+    mlx4::init();
+    /* Its names, as igb's and mlx4's, are the lowest ethN the device table has free
        (net::free_eth_name): the order of the two says only which card is
        eth0 on a machine with both. virtio-net still names itself by a count
        of its own -- probed after these on x86-64 (rust_virtio_net_init),
@@ -197,5 +198,6 @@ pub extern "C" fn rust_fini(power_off: i32) {
     r8168::shutdown();
     r8125::shutdown();
     igb::shutdown();
+    mlx4::shutdown();
     e1000e::shutdown();
 }
