@@ -787,7 +787,7 @@ struct Qp {
     rx: bool,
 }
 
-fn dump_qp_mailbox(m: &crate::dma::DmaBuf) {
+pub fn dump_qp_mailbox(m: &crate::dma::DmaBuf) {
     for line in (0..0x100).step_by(0x10) {
         let mut s = String::new();
         for i in line..line + 0x10 {
@@ -908,6 +908,10 @@ impl Port {
 
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    pub fn qpns(&self) -> (u32, u32) {
+        (self.rx_qpn, self.tx_qpn)
     }
 
     pub fn link_up(&self) -> bool {
@@ -1079,6 +1083,7 @@ impl Port {
             tx_prod: self.tx_prod,
             tx_done: self.tx_done,
             tx_broken: self.tx_broken,
+            gap_reported: false,
             pci,
         };
         (rx, tx)
@@ -1133,25 +1138,68 @@ pub struct TxPort {
     tx_prod: u32,
     tx_done: u32,
     tx_broken: bool,
+    gap_reported: bool,
     pci: PciIo,
 }
 
 impl TxPort {
     fn reap_tx(&mut self) {
         while let Some(e) = self.tx_cq.peek() {
-            if e.u8(0x1f) & 0x1f == CQE_ERROR {
-                self.tx_broken = true;
+            let wqe_index = e.be16(0x18);
+            let steps = wqe_index.wrapping_sub(self.tx_done as u16);
+            if steps != 0 && !self.gap_reported {
                 say!(
-                    "mlx4: port {} tx error completion, syndrome {:#04x} (vendor {:#04x})",
+                    "mlx4: port {} tx completion gap: wqe {} prod {} done {}, skipping {} WQEs",
                     self.num,
+                    wqe_index,
+                    self.tx_prod,
+                    self.tx_done,
+                    steps
+                );
+                self.gap_reported = true;
+            }
+            if e.u8(0x1f) & 0x1f == CQE_ERROR && !self.tx_broken {
+                let error_slot = usize::from(wqe_index) % TX_TXBBS as usize;
+                let w = self.sq.slice(error_slot * TXBB, TXBB);
+                say!(
+                    "mlx4: port {} tx error: qpn {:#x} wqe {} prod {} done {} cq_ci {}, syndrome {:#04x} (vendor {:#04x})",
+                    self.num,
+                    e.be32(0x00),
+                    wqe_index,
+                    self.tx_prod,
+                    self.tx_done,
+                    self.tx_cq.ci,
                     e.u8(0x1b),
                     e.u8(0x1a)
                 );
+                say!(
+                    "mlx4: port {} failing WQE: ctrl {:#010x} len {} lkey {:#010x} addr {:#018x}",
+                    self.num,
+                    w.be32(0x00),
+                    w.be32(0x10),
+                    w.be32(0x14),
+                    w.be64(0x18)
+                );
+                self.tx_broken = true;
             }
-            let slot = (self.tx_done % TX_TXBBS) as usize;
-            let owner = (self.tx_done / TX_TXBBS) & 1;
-            self.sq.set_be32(slot * TXBB, 0x7fff_ffff | owner << 31);
-            self.tx_done = self.tx_done.wrapping_add(1);
+            if steps >= TX_TXBBS as u16 {
+                say!(
+                    "mlx4: port {} tx completion outside the ring: wqe {} done {}, {} steps",
+                    self.num,
+                    wqe_index,
+                    self.tx_done,
+                    steps
+                );
+                self.tx_broken = true;
+                self.tx_cq.pop();
+                continue;
+            }
+            for _ in 0..=steps {
+                let slot = (self.tx_done % TX_TXBBS) as usize;
+                let owner = (self.tx_done / TX_TXBBS) & 1;
+                self.sq.set_be32(slot * TXBB, 0x7fff_ffff | owner << 31);
+                self.tx_done = self.tx_done.wrapping_add(1);
+            }
             self.tx_cq.pop();
         }
     }
@@ -1194,6 +1242,10 @@ impl TxPort {
         let owner = if self.tx_prod & TX_TXBBS != 0 { 1 << 31 } else { 0 };
         w.set_be32(0x00, owner | OP_SEND);
         self.tx_prod = self.tx_prod.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn doorbell(&mut self) -> Result<(), Send> {
         kcore::barrier::dma_wmb();
         let off = u64::from(self.uar) * PAGE as u64 + 0x14;
         self.pci.mem_write32(self.uar_bar, off, (self.tx_qpn << 8).to_be()).map_err(|e| {

@@ -309,9 +309,11 @@ def x86(args):
     os.makedirs(os.path.join(rootdir, "etc"))
     shutil.copy(module, rootdir)
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
-        f.write("# netload-test.py\ninsmod /netload.ko\nnetload start %d\n"
-                "netload send %s %d size=%d pps=%d count=%d tasks=%d\n" % (
-                    LOAD_PORT, HOST_FROM_GUEST, SINK_PORT, PACED_SIZE, PACED_PPS, PACED_COUNT,
+        f.write("# netload-test.py\ninsmod /netload.ko\n")
+        f.write("netload start %d nic=missing\n" % LOAD_PORT)
+        f.write("netload start %d nic=eth0\n" % LOAD_PORT)
+        f.write("netload send %s %d size=%d pps=%d count=%d tasks=%d nic=eth0\n" % (
+                    HOST_FROM_GUEST, SINK_PORT, PACED_SIZE, PACED_PPS, PACED_COUNT,
                     PACED_TASKS))
     subprocess.run([os.path.join(ROOT, "scripts", "mkrootfs.sh"), image, "64", rootdir, "1024"],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
@@ -336,8 +338,10 @@ def x86(args):
     try:
         if not pt.check("boots", pt.wait_log(log, "boot: complete", 400)):
             return 1
-        pt.check("the module loads and the target starts, from /etc/rc",
-                 pt.wait_log(log, "netload: listening on udp %d, echo" % LOAD_PORT, 120))
+        pt.check("a NIC that does not exist is refused",
+                 pt.wait_log(log, "netload: could not start on port %d: no such network device" % LOAD_PORT, 120))
+        pt.check("the module loads and the target starts on the chosen NIC, from /etc/rc",
+                 pt.wait_log(log, "netload: listening on udp %d, echo, nic=eth0" % LOAD_PORT, 120))
         pt.check("and the source, its destination's address resolved",
                  pt.wait_log(log, "netload: sending to %s:%d" % (HOST_FROM_GUEST, SINK_PORT), 60),
                  "\n".join(l for l in open(log, errors="replace").read().splitlines() if "netload" in l))
@@ -447,8 +451,9 @@ def main():
             return 1
         pt.check("and says nothing is running", "not running" in sh.run("netload"))
 
-        out = sh.run("netload start %d" % LOAD_PORT)
-        pt.check("netload starts in echo mode", "echo" in out and "listening" in out, out)
+        out = sh.run("netload start %d nic=eth0" % LOAD_PORT)
+        pt.check("netload starts in echo mode on the chosen NIC",
+                 "echo" in out and "listening" in out and "nic=eth0" in out, out)
 
         sock = udp_socket()
         target = ("127.0.0.1", LOAD_PORT)
@@ -507,8 +512,8 @@ def main():
         pt.check("and answers nothing once stopped", collect(sock, 2) == [])
 
         # Sink mode: counted, never answered.
-        out = sh.run("netload start %d sink" % LOAD_PORT)
-        pt.check("netload starts in sink mode", "sink" in out, out)
+        out = sh.run("netload start %d sink nic=eth0" % LOAD_PORT)
+        pt.check("netload starts in sink mode on the chosen NIC", "sink" in out and "nic=eth0" in out, out)
         for _ in range(50):
             seq += 1
             sock.sendto(payload(seq, 200), target)
@@ -554,6 +559,9 @@ def main():
             out = sh.run(bad)
             pt.check("send is refused: " + why, "usage" in out and "sending to" not in out, out)
         pt.check("and a refused send leaves nothing running", "not running" in sh.run("netload"))
+        out = sh.run("netload send %s %d nic=missing" % (HOST_FROM_GUEST, SINK_PORT))
+        pt.check("a source refuses a NIC that does not exist",
+                 "no such network device" in out and "sending to" not in out, out)
 
         out = sh.run("netload send %s %d" % (NOBODY, SINK_PORT))
         pt.check("an address nothing answers ARP for is refused",
@@ -561,7 +569,7 @@ def main():
         pt.check("and nothing was sent to it", "not running" in sh.run("netload"))
 
         # Paced: slow enough to arrive whole, so every datagram is owed.
-        out = sh.run("netload send %s %d size=%d pps=%d count=%d tasks=%d" % (
+        out = sh.run("netload send %s %d size=%d pps=%d count=%d tasks=%d nic=eth0" % (
             HOST_FROM_GUEST, SINK_PORT, PACED_SIZE, PACED_PPS, PACED_COUNT, PACED_TASKS))
         pt.check("netload sends", "sending to %s:%d" % (HOST_FROM_GUEST, SINK_PORT) in out, out)
         arrived = drain(sink, 3, echo=True)

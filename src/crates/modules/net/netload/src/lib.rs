@@ -48,6 +48,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -69,8 +70,8 @@ const HELP: &str =
     "netload [start [port] [sink] | send <ip> <port> [opt=..] | stop | reset] - udp load test";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
-const USAGE: &str = "usage: netload [start [port] [sink] | send <ip> <port> [size=64] [pps=0] \
-[secs=0] [count=0] [tasks=1] [sport=9998] | stop | reset]";
+const USAGE: &str = "usage: netload [start [port] [sink] [nic=ethN] | send <ip> <port> [size=64] \
+[pps=0] [secs=0] [count=0] [tasks=1] [sport=9998] [nic=ethN] | stop | reset]";
 
 const DEFAULT_NIC: &str = "eth0";
 
@@ -432,8 +433,9 @@ impl Drop for TargetRun {
 /* ------------------------------------------------------------------ */
 
 /// What `netload send` was asked for.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SendPlan {
+    nic: String,
     ip: u32,
     port: u16,
     source_port: u16,
@@ -713,13 +715,13 @@ impl State {
         }
     }
 
-    fn start_target(&self, port: u16, echo: bool) -> Result<(), &'static str> {
+    fn start_target(&self, port: u16, echo: bool, nic_name: &str) -> Result<(), &'static str> {
         let _turn = self.control.try_lock().ok_or(BUSY)?;
 
         if self.target.lock().is_some() {
             return Err("already running");
         }
-        let run = build_target(port, echo)?;
+        let run = build_target(port, echo, nic_name)?;
 
         /* The slot is empty and nobody else fills it while the turn is ours;
          * should that ever stop being so, what was there is dropped here,
@@ -729,7 +731,7 @@ impl State {
         Ok(())
     }
 
-    fn start_source(&self, plan: SendPlan) -> Result<(), &'static str> {
+    fn start_source(&self, plan: &SendPlan) -> Result<(), &'static str> {
         let _turn = self.control.try_lock().ok_or(BUSY)?;
 
         /* One that has finished is only waiting to be asked about: a new one
@@ -765,8 +767,8 @@ impl State {
     }
 }
 
-fn build_target(port: u16, echo: bool) -> Result<TargetRun, &'static str> {
-    let nic = Nic::find(DEFAULT_NIC).ok_or("no eth0")?;
+fn build_target(port: u16, echo: bool, nic_name: &str) -> Result<TargetRun, &'static str> {
+    let nic = Nic::find(nic_name).ok_or("no such network device")?;
 
     clear(&TARGET_COUNTS);
     let target = Arc::new(Target {
@@ -806,11 +808,11 @@ fn build_target(port: u16, echo: bool) -> Result<TargetRun, &'static str> {
     Ok(run)
 }
 
-fn build_source(plan: SendPlan) -> Result<SourceRun, &'static str> {
-    let nic = Nic::find(DEFAULT_NIC).ok_or("no eth0")?;
+fn build_source(plan: &SendPlan) -> Result<SourceRun, &'static str> {
+    let nic = Nic::find(&plan.nic).ok_or("no such network device")?;
     let src_ip = nic.ip();
     if src_ip == 0 {
-        return Err("eth0 has no address yet");
+        return Err("network device has no address yet");
     }
 
     /* Asked once, before the first frame, and here rather than in a sender:
@@ -826,13 +828,13 @@ fn build_source(plan: SendPlan) -> Result<SourceRun, &'static str> {
         dst_port: plan.port,
         dont_fragment: false,
     };
-    let template = Source::template(&plan, &route).ok_or("not a size a datagram can have")?;
+    let template = Source::template(plan, &route).ok_or("not a size a datagram can have")?;
 
     clear(&SOURCE_COUNTS);
     let now = boot_time_ns();
     let source = Arc::new(Source {
         nic,
-        plan,
+        plan: plan.clone(),
         template,
         deadline_ns: if plan.secs == 0 { 0 } else { now.saturating_add(plan.secs * NS_PER_SEC) },
         started_ns: now,
@@ -899,29 +901,35 @@ fn command(state: &State, args: &str, out: &mut Output) {
 
     match verb {
         "start" => {
-            /* start [port] [sink], and `sink` alone means the default port. */
             let mut port = DEFAULT_PORT;
+            let mut port_given = false;
             let mut echo = true;
-            match words.next() {
-                None => {}
-                Some("sink") => echo = false,
-                Some(text) => match text.parse::<u16>() {
-                    Ok(parsed) if parsed != 0 => {
-                        port = parsed;
-                        match words.next() {
-                            None => {}
-                            Some("sink") => echo = false,
-                            Some(_) => { let _ = writeln!(out, "{}", USAGE); return; }
+            let mut nic_name = DEFAULT_NIC;
+            for word in words {
+                match word {
+                    "sink" => echo = false,
+                    _ if word.starts_with("nic=") => {
+                        nic_name = &word[4..];
+                        if nic_name.is_empty() {
+                            let _ = writeln!(out, "{}", USAGE);
+                            return;
                         }
                     }
+                    _ if !port_given => match word.parse::<u16>() {
+                        Ok(parsed) if parsed != 0 => {
+                            port = parsed;
+                            port_given = true;
+                        }
+                        _ => { let _ = writeln!(out, "{}", USAGE); return; }
+                    },
                     _ => { let _ = writeln!(out, "{}", USAGE); return; }
-                },
+                }
             }
 
-            match state.start_target(port, echo) {
+            match state.start_target(port, echo, nic_name) {
                 Ok(()) => {
-                    let _ = writeln!(out, "netload: listening on udp {}, {}", port,
-                        if echo { "echo" } else { "sink" });
+                    let _ = writeln!(out, "netload: listening on udp {}, {}, nic={}", port,
+                        if echo { "echo" } else { "sink" }, nic_name);
                 }
                 Err(problem) => {
                     let _ = writeln!(out, "netload: could not start on port {}: {}", port, problem);
@@ -937,7 +945,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
                     return;
                 }
             };
-            match state.start_source(plan) {
+            match state.start_source(&plan) {
                 Ok(()) => {
                     let _ = writeln!(out, "netload: sending to {}:{} from port {}, {} byte datagrams, {} task(s){}",
                         Ipv4(plan.ip), plan.port, plan.source_port, plan.size, plan.tasks,
@@ -984,6 +992,7 @@ fn parse_send<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<SendPlan,
         .ok_or("and a port")?;
 
     let mut plan = SendPlan {
+        nic: String::from(DEFAULT_NIC),
         ip, port,
         source_port: DEFAULT_SOURCE_PORT,
         size: DEFAULT_SIZE,
@@ -995,6 +1004,13 @@ fn parse_send<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<SendPlan,
 
     for word in words {
         let (key, value) = word.split_once('=').ok_or("options are key=value")?;
+        if key == "nic" {
+            if value.is_empty() {
+                return Err("nic= names a network device");
+            }
+            plan.nic = String::from(value);
+            continue;
+        }
         let number = value.parse::<u64>().map_err(|_| "an option's value is a number")?;
         match key {
             "size" => {
@@ -1018,7 +1034,7 @@ fn parse_send<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<SendPlan,
                 }
                 plan.source_port = number as u16;
             }
-            _ => return Err("size=, pps=, secs=, count=, tasks= or sport="),
+            _ => return Err("size=, pps=, secs=, count=, tasks=, sport= or nic="),
         }
     }
 

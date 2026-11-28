@@ -479,8 +479,8 @@ per cpu tx: 0:150 1:150
 and the target, on another machine, is `netload start` -- then
 `netload send <its address> 9999` from the first.
 
-    netload start [port] [sink]
-    netload send <ip> <port> [size=64] [pps=0] [secs=0] [count=0] [tasks=1] [sport=9998]
+    netload start [port] [sink] [nic=ethN]
+    netload send <ip> <port> [size=64] [pps=0] [secs=0] [count=0] [tasks=1] [sport=9998] [nic=ethN]
     netload            what either has counted
     netload stop       both
     netload reset      the counters
@@ -501,9 +501,10 @@ once, and a sequence number -- and handing them to the NIC a batch at a
 time.
 
 - `size` is the payload, 16 to 1472 bytes. `pps` is a rate over all the
-  senders, and 0 is as fast as the NIC takes them. The run ends when `count`
-  datagrams are sent, when `secs` have passed, or at `netload stop`; a
-  finished run stays to be asked about until the next `send`.
+  senders, and 0 is as fast as the NIC takes them. `nic=ethN` selects the
+  interface for a source or target; without it both use `eth0`. The run ends
+  when `count` datagrams are sent, when `secs` have passed, or at `netload
+  stop`; a finished run stays to be asked about until the next `send`.
 - The destination's Ethernet address is asked of ARP once, before the first
   frame -- the gateway's, for an address off the subnet. If nothing answers,
   nothing is sent: a load test does not fall back to broadcast.
